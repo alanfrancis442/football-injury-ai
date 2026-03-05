@@ -1,0 +1,59 @@
+# configs/module1.yaml
+#
+# All hyperparameters for Module 1 — Biomechanical Risk Monitor
+# ──────────────────────────────────────────────────────────────
+# Edit values HERE. Never hardcode numbers inside model or training scripts.
+# Each section maps to one stage of the pipeline.
+
+# ── File paths ────────────────────────────────────────────────────────────────
+paths:
+  raw_dir:        data/raw/
+  processed_dir:  data/processed/
+  samples_dir:    data/samples/
+  checkpoint_dir: outputs/checkpoints/
+  log_dir:        outputs/logs/
+
+# ── Stage 1: Pose Extraction ──────────────────────────────────────────────────
+pose:
+  min_detection_confidence: 0.5   # lower = detects more but less accurate
+  min_tracking_confidence:  0.5
+  iou_threshold:            0.4   # for SimpleTracker bbox matching
+  max_frames_lost:          10    # frames before a player track is dropped
+
+# ── Stage 2: Graph Neural Network ─────────────────────────────────────────────
+gnn:
+  in_channels:  10    # node feature size: (x,y,z, vx,vy,vz, ax,ay,az, angle, vis) = 10
+  hidden_dim:   64    # internal representation width
+  out_dim:      64    # output spatial feature vector size (feeds into Transformer)
+  heads:        4     # attention heads per GAT layer
+  dropout:      0.1
+
+# ── Stage 3: Transformer ──────────────────────────────────────────────────────
+transformer:
+  seq_len:          50    # frames in sliding window (2s at 25fps)
+  d_model:          128   # internal transformer width
+  nhead:            4     # attention heads
+  num_layers:       2     # number of TransformerEncoderLayer blocks
+  dim_feedforward:  256   # feedforward expansion in each encoder layer
+  dropout:          0.1
+  region_loss_weight: 0.3 # weight of body-region loss vs. risk binary loss
+
+# ── Training (shared by both GNN and Transformer training scripts) ─────────────
+training:
+  epochs:               50
+  batch_size:           32
+  learning_rate:        0.001
+  weight_decay:         0.0001
+
+  # Class imbalance — injuries are rare so we up-weight the injury class
+  class_weight_healthy: 1.0
+  class_weight_injury:  3.0    # increase if model is missing too many injuries
+
+# ── Inference / risk thresholds ───────────────────────────────────────────────
+inference:
+  risk_tier_thresholds:
+    green:  0.30
+    amber:  0.55
+    orange: 0.75
+    # above 0.75 = RED
+  sustained_window: 3    # consecutive 30s windows before escalating alert tier

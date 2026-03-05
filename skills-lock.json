@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "skills": {
+    "pytorch-lightning": {
+      "source": "davila7/claude-code-templates",
+      "sourceType": "github",
+      "computedHash": "ca5ca05097e4ad9cc07db0a5f314303d751c447a78b80163058c75d586a7c9e9"
+    },
+    "skill-writer": {
+      "source": "pytorch/pytorch",
+      "sourceType": "github",
+      "computedHash": "c220867183e2f6a32290b0c87d6dcc56ce507154e20ae7cb64ad91bee2d4677e"
+    }
+  }
+}
