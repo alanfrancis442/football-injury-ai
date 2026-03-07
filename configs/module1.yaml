@@ -1,53 +1,58 @@
 # configs/module1.yaml
 #
-# All hyperparameters for Module 1 — Biomechanical Risk Monitor
-# ──────────────────────────────────────────────────────────────
-# Edit values HERE. Never hardcode numbers inside model or training scripts.
-# Each section maps to one stage of the pipeline.
+# Module 1 — Biomechanical Risk Monitor  (fine-tuning / inference config)
+# ────────────────────────────────────────────────────────────────────────
+# Hyperparameters for fine-tuning the pretrained SpatioTemporalEncoder on
+# labelled football clips and for real-time inference.
+#
+# Pretraining hyperparameters are in configs/pretrain.yaml.
+# Never hardcode any of these values inside Python files.
 
 # ── File paths ────────────────────────────────────────────────────────────────
 paths:
-  raw_dir:        data/raw/
-  processed_dir:  data/processed/
-  samples_dir:    data/samples/
-  checkpoint_dir: outputs/checkpoints/
-  log_dir:        outputs/logs/
+  raw_dir:           data/raw/
+  processed_dir:     data/processed/
+  samples_dir:       data/samples/
+  checkpoint_dir:    outputs/checkpoints/
+  log_dir:           outputs/logs/
+  pretrained_encoder: outputs/checkpoints/pretrain/pretrain_best.pt
 
-# ── Stage 1: Pose Extraction ──────────────────────────────────────────────────
-pose:
-  min_detection_confidence: 0.5   # lower = detects more but less accurate
-  min_tracking_confidence:  0.5
-  iou_threshold:            0.4   # for SimpleTracker bbox matching
-  max_frames_lost:          10    # frames before a player track is dropped
+# ── Skeleton / data format ────────────────────────────────────────────────────
+data:
+  num_joints:   32       # ANUBIS 32-joint pelvis-rooted skeleton
+  in_features:   9       # per-joint features: [x,y,z, vx,vy,vz, ax,ay,az]
+  seq_len:      60       # frames per sliding window fed to the model
+  num_classes:   2       # binary: healthy (0) / at-risk (1)
 
-# ── Stage 2: Graph Neural Network ─────────────────────────────────────────────
-gnn:
-  in_channels:  10    # node feature size: (x,y,z, vx,vy,vz, ax,ay,az, angle, vis) = 10
-  hidden_dim:   64    # internal representation width
-  out_dim:      64    # output spatial feature vector size (feeds into Transformer)
-  heads:        4     # attention heads per GAT layer
-  dropout:      0.1
+# ── Model (must match pretrained encoder dims) ────────────────────────────────
+model:
+  gat_hidden_dim:          64
+  gat_heads:                4
+  gat_dropout:            0.1
+  d_model:                128
+  nhead:                    4
+  num_transformer_layers:   2
+  dim_feedforward:        256
+  transformer_dropout:    0.1
 
-# ── Stage 3: Transformer ──────────────────────────────────────────────────────
-transformer:
-  seq_len:          50    # frames in sliding window (2s at 25fps)
-  d_model:          128   # internal transformer width
-  nhead:            4     # attention heads
-  num_layers:       2     # number of TransformerEncoderLayer blocks
-  dim_feedforward:  256   # feedforward expansion in each encoder layer
-  dropout:          0.1
-  region_loss_weight: 0.3 # weight of body-region loss vs. risk binary loss
-
-# ── Training (shared by both GNN and Transformer training scripts) ─────────────
+# ── Fine-tuning ───────────────────────────────────────────────────────────────
 training:
-  epochs:               50
-  batch_size:           32
-  learning_rate:        0.001
-  weight_decay:         0.0001
+  epochs:            30
+  batch_size:        32
+  learning_rate:  0.0001   # lower LR for fine-tuning
+  weight_decay:  0.0001
+  warmup_epochs:      2
+  grad_clip_norm:   1.0
+  label_smoothing:  0.05
 
-  # Class imbalance — injuries are rare so we up-weight the injury class
+  # Class imbalance — at-risk samples are rare; increase if model misses them
   class_weight_healthy: 1.0
-  class_weight_injury:  3.0    # increase if model is missing too many injuries
+  class_weight_at_risk: 4.0
+
+# ── Body-region localisation head ────────────────────────────────────────────
+region_head:
+  num_regions:         11   # matches NUM_REGIONS in joint_config.py
+  region_loss_weight: 0.3   # weight of region-classification loss
 
 # ── Inference / risk thresholds ───────────────────────────────────────────────
 inference:
@@ -55,5 +60,5 @@ inference:
     green:  0.30
     amber:  0.55
     orange: 0.75
-    # above 0.75 = RED
-  sustained_window: 3    # consecutive 30s windows before escalating alert tier
+    # above 0.75 → RED
+  sustained_window: 3    # consecutive windows before escalating alert tier
