@@ -44,7 +44,7 @@ model:
 
 # ── Training ──────────────────────────────────────────────────────────────────
 training:
-  epochs:               80
+  epochs:              120
   batch_size:           64
   learning_rate:      0.0005
   weight_decay:      0.0005
