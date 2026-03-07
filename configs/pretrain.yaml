@@ -20,7 +20,7 @@ data:
   val_features:       val_features_cleaned.npy   # only used when has_separate_val=true
   val_labels:         val_labels_cleaned.npy
 
-  has_separate_val:   false   # set true once val files are copied to anubis_dir
+  has_separate_val:   true    # using separate val files
   val_split:          0.15    # fraction of training set used for val when has_separate_val=false
 
   num_classes:        102     # ANUBIS action categories

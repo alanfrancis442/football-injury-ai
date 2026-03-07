@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import os
 from typing import Dict, List, Optional, Tuple
 
@@ -162,7 +163,18 @@ def plot_tsne(
         labels = labels[idx]
 
     log.info("Running t-SNE on %d samples (d=%d) …", len(labels), embeddings.shape[1])
-    tsne = TSNE(n_components=2, perplexity=perplexity, random_state=42, n_iter=1000)
+    tsne_kwargs = {
+        "n_components": 2,
+        "perplexity": perplexity,
+        "random_state": 42,
+    }
+    # scikit-learn renamed n_iter -> max_iter in newer versions.
+    if "max_iter" in inspect.signature(TSNE.__init__).parameters:
+        tsne_kwargs["max_iter"] = 1000
+    else:
+        tsne_kwargs["n_iter"] = 1000
+
+    tsne = TSNE(**tsne_kwargs)
     coords = tsne.fit_transform(embeddings)  # (N, 2)
 
     num_classes = int(labels.max()) + 1
@@ -230,7 +242,9 @@ def load_checkpoint(
 # ── Main evaluation entry point ───────────────────────────────────────────────
 
 
-def main(config_path: str, ckpt_path: str, split: str, run_tsne: bool) -> None:
+def main(
+    config_path: str, ckpt_path: str, split: str, run_tsne: bool
+) -> Dict[str, float]:
     cfg = load_config(config_path)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info("Device: %s", device)
