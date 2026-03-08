@@ -1,29 +1,20 @@
 # module1/pretrain/model.py
 #
-# Stage 1 — SpatioTemporalEncoder + ActionClassifier
-# ────────────────────────────────────────────────────
-# End-to-end model that encodes a sequence of skeleton graphs:
+# Stage 1 - SpatioTemporalEncoder + ActionClassifier
+# ---------------------------------------------------
+# End-to-end model that encodes a sequence of skeleton graphs.
 #
-#   Input : (B, T, J, F)  — batch, frames, joints, features (pos+vel+acc = 9)
+# Input: (B, T, J, F) where F=9 [x,y,z,vx,vy,vz,ax,ay,az].
 #
-#   Spatial stage — time-distributed GAT (shared weights across all T frames):
-#     GATConv( F → 16, heads=4, concat=True)  → 64-dim per node + BN + ELU
-#     GATConv(64 → 16, heads=4, concat=True)  → 64-dim per node + BN + ELU
-#     GATConv(64 → 64, heads=1, concat=False) → 64-dim per node + BN + ELU
-#     global_mean_pool over joints             → (B*T, 64)
-#     reshape                                  → (B, T, 64)
+# Spatial stage (shared across all T frames):
+#   GATConv -> BN -> ELU -> Dropout
+#   GATConv -> BN -> ELU -> Dropout
+#   GATConv -> BN -> ELU
+#   global_mean_pool over joints -> (B, T, gat_hidden)
 #
-#   Temporal stage — Transformer encoder:
-#     input_proj Linear(64 → d_model)
-#     prepend CLS token
-#     sinusoidal positional encoding
-#     2 × TransformerEncoderLayer (pre-norm, nhead=4, ff=256)
-#     LayerNorm
-#     extract CLS output                       → (B, d_model)
-#
-#   ActionClassifier wraps SpatioTemporalEncoder with a linear head for
-#   102-class ANUBIS pretraining.  After pretraining, save only the encoder
-#   (encoder.state_dict()) and attach new fine-tuning heads.
+# Temporal stage (configurable):
+#   1) Transformer (baseline): CLS + sinusoidal position + TransformerEncoder
+#   2) Perceiver latent bottleneck: cross-attn + latent self-attn (+ optional RoPE)
 
 from __future__ import annotations
 
@@ -40,7 +31,7 @@ from utils.logger import get_logger
 log = get_logger(__name__)
 
 
-# ── Positional Encoding ────────────────────────────────────────────────────────
+# -- Positional encoding -------------------------------------------------------
 
 
 class PositionalEncoding(nn.Module):
@@ -49,16 +40,19 @@ class PositionalEncoding(nn.Module):
 
     Parameters
     ----------
-    d_model  : int   embedding dimension
-    max_len  : int   maximum sequence length (including CLS token)
-    dropout  : float dropout applied after adding the encoding
+    d_model : int
+        Embedding dimension.
+    max_len : int
+        Maximum sequence length.
+    dropout : float
+        Dropout applied after adding positional encoding.
     """
 
     def __init__(self, d_model: int, max_len: int = 128, dropout: float = 0.1) -> None:
         super().__init__()
         self.dropout = nn.Dropout(p=dropout)
 
-        position = torch.arange(max_len).unsqueeze(1).float()  # (max_len, 1)
+        position = torch.arange(max_len).unsqueeze(1).float()
         div_term = torch.exp(
             torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
         )
@@ -68,45 +62,246 @@ class PositionalEncoding(nn.Module):
         self.register_buffer("pe", pe)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        x : torch.Tensor  shape (B, T, d_model)
-
-        Returns
-        -------
-        out : torch.Tensor  shape (B, T, d_model)
-        """
         x = x + self.pe[:, : x.size(1), :]
         return self.dropout(x)
 
 
-# ── SpatioTemporalEncoder ─────────────────────────────────────────────────────
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotate even/odd features for rotary embedding."""
+    x_even = x[..., ::2]
+    x_odd = x[..., 1::2]
+    x_rot = torch.stack((-x_odd, x_even), dim=-1)
+    return x_rot.flatten(-2)
+
+
+class RotaryEmbedding(nn.Module):
+    """
+    Rotary positional embedding helper for attention Q/K tensors.
+
+    Parameters
+    ----------
+    dim : int
+        Attention head dimension (must be even).
+    base : float
+        RoPE base frequency.
+    """
+
+    def __init__(self, dim: int, base: float = 10000.0) -> None:
+        super().__init__()
+        if dim % 2 != 0:
+            raise ValueError(f"RoPE requires even head dimension, got dim={dim}")
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq)
+
+    def get_cos_sin(
+        self,
+        seq_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return cosine and sine tensors shaped for (B, H, T, D)."""
+        t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(t, self.inv_freq)  # (T, D/2)
+        emb = torch.cat([freqs, freqs], dim=-1)  # (T, D)
+        cos = emb.cos().to(dtype=dtype).unsqueeze(0).unsqueeze(0)
+        sin = emb.sin().to(dtype=dtype).unsqueeze(0).unsqueeze(0)
+        return cos, sin
+
+
+# -- Attention blocks ----------------------------------------------------------
+
+
+class MultiHeadAttention(nn.Module):
+    """
+    Multi-head attention supporting self-attention and cross-attention.
+
+    Parameters
+    ----------
+    d_model : int
+        Embedding dimension.
+    nhead : int
+        Number of attention heads.
+    dropout : float
+        Dropout on attention probabilities and output projection.
+    cross_attention : bool
+        If True, query comes from x and key/value comes from context.
+    use_rope : bool
+        If True, apply RoPE to q/k tensors.
+    rope_base : float
+        RoPE base frequency.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dropout: float = 0.1,
+        cross_attention: bool = False,
+        use_rope: bool = False,
+        rope_base: float = 10000.0,
+    ) -> None:
+        super().__init__()
+        if d_model % nhead != 0:
+            raise ValueError(f"d_model={d_model} must be divisible by nhead={nhead}")
+
+        self.d_model = d_model
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+        self.scale = self.head_dim**-0.5
+        self.cross_attention = cross_attention
+        self.use_rope = use_rope
+
+        if cross_attention:
+            self.q_proj = nn.Linear(d_model, d_model)
+            self.kv_proj = nn.Linear(d_model, 2 * d_model)
+        else:
+            self.qkv_proj = nn.Linear(d_model, 3 * d_model)
+
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.out_dropout = nn.Dropout(dropout)
+
+        if use_rope:
+            self.rope = RotaryEmbedding(self.head_dim, base=rope_base)
+        else:
+            self.rope = None
+
+    def _reshape_heads(self, x: torch.Tensor) -> torch.Tensor:
+        """(B, T, D) -> (B, H, T, Dh)"""
+        B, T, _ = x.shape
+        x = x.view(B, T, self.nhead, self.head_dim)
+        return x.permute(0, 2, 1, 3)
+
+    def _merge_heads(self, x: torch.Tensor) -> torch.Tensor:
+        """(B, H, T, Dh) -> (B, T, D)"""
+        B, H, T, Dh = x.shape
+        return x.permute(0, 2, 1, 3).contiguous().view(B, T, H * Dh)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        context: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        x : torch.Tensor
+            Query tensor, shape (B, Tq, D).
+        context : torch.Tensor, optional
+            Key/value source, shape (B, Tk, D). Required for cross-attention.
+
+        Returns
+        -------
+        out : torch.Tensor
+            Attention output, shape (B, Tq, D).
+        """
+        if self.cross_attention:
+            if context is None:
+                raise ValueError("context is required for cross-attention")
+            q = self.q_proj(x)
+            kv = self.kv_proj(context)
+            k, v = torch.chunk(kv, 2, dim=-1)
+        else:
+            qkv = self.qkv_proj(x)
+            q, k, v = torch.chunk(qkv, 3, dim=-1)
+
+        q = self._reshape_heads(q)
+        k = self._reshape_heads(k)
+        v = self._reshape_heads(v)
+
+        if self.rope is not None:
+            cos_q, sin_q = self.rope.get_cos_sin(q.shape[2], q.device, q.dtype)
+            cos_k, sin_k = self.rope.get_cos_sin(k.shape[2], k.device, k.dtype)
+            q = (q * cos_q) + (_rotate_half(q) * sin_q)
+            k = (k * cos_k) + (_rotate_half(k) * sin_k)
+
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn_probs = torch.softmax(attn_scores, dim=-1)
+        attn_probs = self.attn_dropout(attn_probs)
+
+        out = torch.matmul(attn_probs, v)
+        out = self._merge_heads(out)
+        out = self.out_proj(out)
+        out = self.out_dropout(out)
+        return out
+
+
+class FeedForward(nn.Module):
+    """Transformer-style feedforward block."""
+
+    def __init__(self, d_model: int, dim_ff: int, dropout: float) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_model, dim_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_ff, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class PerceiverLayer(nn.Module):
+    """
+    One Perceiver layer: cross-attention + latent self-attention + FFN.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        cross_attn_heads: int,
+        self_attn_heads: int,
+        dim_ff: int,
+        dropout: float,
+        use_rope: bool,
+        rope_base: float,
+    ) -> None:
+        super().__init__()
+        self.norm_latent_cross = nn.LayerNorm(d_model)
+        self.norm_input_cross = nn.LayerNorm(d_model)
+        self.norm_latent_self = nn.LayerNorm(d_model)
+        self.norm_ff = nn.LayerNorm(d_model)
+
+        self.cross_attn = MultiHeadAttention(
+            d_model=d_model,
+            nhead=cross_attn_heads,
+            dropout=dropout,
+            cross_attention=True,
+            use_rope=use_rope,
+            rope_base=rope_base,
+        )
+        self.self_attn = MultiHeadAttention(
+            d_model=d_model,
+            nhead=self_attn_heads,
+            dropout=dropout,
+            cross_attention=False,
+            use_rope=use_rope,
+            rope_base=rope_base,
+        )
+        self.ff = FeedForward(d_model=d_model, dim_ff=dim_ff, dropout=dropout)
+
+    def forward(self, latents: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
+        latents = latents + self.cross_attn(
+            x=self.norm_latent_cross(latents),
+            context=self.norm_input_cross(tokens),
+        )
+        latents = latents + self.self_attn(self.norm_latent_self(latents))
+        latents = latents + self.ff(self.norm_ff(latents))
+        return latents
+
+
+# -- SpatioTemporalEncoder -----------------------------------------------------
 
 
 class SpatioTemporalEncoder(nn.Module):
     """
-    End-to-end spatiotemporal encoder: time-distributed GAT + Transformer.
+    End-to-end spatiotemporal encoder: GAT + temporal backbone.
 
-    The encoder is the shared backbone used across all training stages.
-    It outputs a single CLS embedding per sequence.
-
-    Parameters
-    ----------
-    num_joints   : int   number of skeleton joints (32 for ANUBIS)
-    in_features  : int   feature dimension per joint (9: pos+vel+acc)
-    edge_index   : torch.Tensor  shape (2, E)  skeleton connectivity;
-                   registered as a buffer so it moves to device automatically
-    gat_hidden   : int   output dim of every GAT block (default 64)
-    gat_heads    : int   attention heads for GAT layers 1 & 2 (default 4)
-    gat_dropout  : float dropout on GAT attention coefficients
-    d_model      : int   transformer embedding dimension (default 128)
-    nhead        : int   transformer attention heads
-    num_layers   : int   number of TransformerEncoderLayer blocks
-    dim_ff       : int   feedforward expansion inside transformer
-    dropout      : float transformer dropout
-    seq_len      : int   expected sequence length (used to size pos. encoding)
-    cls_std      : float trunc_normal std for CLS-token initialisation
+    Temporal backbones:
+    - "transformer": baseline with CLS token and sinusoidal encoding.
+    - "perceiver": learnable latent bottleneck; supports sinusoidal or RoPE.
     """
 
     def __init__(
@@ -124,6 +319,15 @@ class SpatioTemporalEncoder(nn.Module):
         dropout: float = 0.1,
         seq_len: int = 60,
         cls_std: float = 0.02,
+        temporal_backbone: str = "transformer",
+        positional_encoding: str = "sinusoidal",
+        num_latents: int = 64,
+        num_perceiver_layers: int = 2,
+        cross_attn_heads: int = 4,
+        self_attn_heads: int = 4,
+        perceiver_dim_ff: int = 256,
+        perceiver_dropout: float = 0.1,
+        rope_base: float = 10000.0,
     ) -> None:
         super().__init__()
 
@@ -131,106 +335,177 @@ class SpatioTemporalEncoder(nn.Module):
         self.gat_hidden = gat_hidden
         self.gat_dropout = gat_dropout
         self.d_model = d_model
+        self.temporal_backbone = temporal_backbone.lower()
+        self.positional_encoding = positional_encoding.lower()
 
-        # Register skeleton topology as a non-learnable buffer
-        self.register_buffer("edge_index", edge_index)  # (2, E)
+        self.register_buffer("edge_index", edge_index)
 
-        # ── GAT layers (shared across all time steps) ──────────────────────
-        per_head_dim = gat_hidden // gat_heads  # 16
+        # Spatial GAT stack
+        per_head_dim = gat_hidden // gat_heads
         self.gat1 = GATConv(
-            in_features, per_head_dim, heads=gat_heads, concat=True, dropout=gat_dropout
+            in_features,
+            per_head_dim,
+            heads=gat_heads,
+            concat=True,
+            dropout=gat_dropout,
         )
         self.gat2 = GATConv(
-            gat_hidden, per_head_dim, heads=gat_heads, concat=True, dropout=gat_dropout
+            gat_hidden,
+            per_head_dim,
+            heads=gat_heads,
+            concat=True,
+            dropout=gat_dropout,
         )
         self.gat3 = GATConv(
-            gat_hidden, gat_hidden, heads=1, concat=False, dropout=gat_dropout
+            gat_hidden,
+            gat_hidden,
+            heads=1,
+            concat=False,
+            dropout=gat_dropout,
         )
 
         self.bn1 = nn.BatchNorm1d(gat_hidden)
         self.bn2 = nn.BatchNorm1d(gat_hidden)
         self.bn3 = nn.BatchNorm1d(gat_hidden)
 
-        # ── Transformer ────────────────────────────────────────────────────
         self.input_proj = nn.Linear(gat_hidden, d_model)
 
-        self.cls_token = nn.Parameter(torch.empty(1, 1, d_model))
-        nn.init.trunc_normal_(self.cls_token, std=cls_std)
+        # Optional temporal modules initialised per-backbone.
+        self.pos_enc: Optional[nn.Module] = None
+        self.transformer: Optional[nn.Module] = None
+        self.latents: Optional[nn.Parameter] = None
+        self.perceiver_layers: Optional[nn.ModuleList] = None
 
-        # max_len = seq_len + 1 to accommodate the CLS token
-        self.pos_enc = PositionalEncoding(d_model, max_len=seq_len + 1, dropout=dropout)
+        # Temporal backbone selection
+        if self.temporal_backbone == "transformer":
+            if self.positional_encoding != "sinusoidal":
+                raise ValueError(
+                    "Transformer backbone currently supports only "
+                    "positional_encoding='sinusoidal'."
+                )
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_ff,
-            dropout=dropout,
-            batch_first=True,
-            norm_first=True,  # pre-norm variant — more stable gradients
-            activation="gelu",
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.norm = nn.LayerNorm(d_model)
+            self.cls_token = nn.Parameter(torch.empty(1, 1, d_model))
+            nn.init.trunc_normal_(self.cls_token, std=cls_std)
 
-    # ── Internal helpers ───────────────────────────────────────────────────────
+            self.pos_enc = PositionalEncoding(
+                d_model=d_model,
+                max_len=seq_len + 1,
+                dropout=dropout,
+            )
+
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=dim_ff,
+                dropout=dropout,
+                batch_first=True,
+                norm_first=True,
+                activation="gelu",
+            )
+            self.transformer = nn.TransformerEncoder(
+                encoder_layer, num_layers=num_layers
+            )
+            self.norm = nn.LayerNorm(d_model)
+
+        elif self.temporal_backbone == "perceiver":
+            if self.positional_encoding not in ("sinusoidal", "rope"):
+                raise ValueError(
+                    "Perceiver backbone supports positional_encoding='sinusoidal' "
+                    "or 'rope'."
+                )
+
+            self.latents = nn.Parameter(torch.empty(1, num_latents, d_model))
+            nn.init.trunc_normal_(self.latents, std=cls_std)
+
+            self.pos_enc = None
+            if self.positional_encoding == "sinusoidal":
+                self.pos_enc = PositionalEncoding(
+                    d_model=d_model,
+                    max_len=seq_len,
+                    dropout=perceiver_dropout,
+                )
+
+            use_rope = self.positional_encoding == "rope"
+            self.perceiver_layers = nn.ModuleList(
+                [
+                    PerceiverLayer(
+                        d_model=d_model,
+                        cross_attn_heads=cross_attn_heads,
+                        self_attn_heads=self_attn_heads,
+                        dim_ff=perceiver_dim_ff,
+                        dropout=perceiver_dropout,
+                        use_rope=use_rope,
+                        rope_base=rope_base,
+                    )
+                    for _ in range(num_perceiver_layers)
+                ]
+            )
+            self.norm = nn.LayerNorm(d_model)
+
+        else:
+            raise ValueError(
+                f"Unsupported temporal_backbone='{temporal_backbone}'. "
+                "Use 'transformer' or 'perceiver'."
+            )
 
     def _gat_forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Process all T frames through the GAT in a single batched pass.
-
-        Each (frame, sequence) pair is treated as an independent graph.
-        All B*T graphs share the same edge topology (self.edge_index).
-
-        Parameters
-        ----------
-        x : torch.Tensor  shape (B, T, J, F)
-
-        Returns
-        -------
-        spatial : torch.Tensor  shape (B, T, gat_hidden)
-        """
+        """Run all B*T graphs through GAT in one batched pass."""
         B, T, J, Fin = x.shape
         num_graphs = B * T
 
-        # Flatten nodes: (B*T*J, Fin)
         x_nodes = x.reshape(num_graphs * J, Fin)
 
-        # Build batched edge index by offsetting each graph's node indices by J
-        # edge_index: (2, E)  →  broadcast to (2, num_graphs, E)
         E = self.edge_index.shape[1]
-        offsets = torch.arange(num_graphs, device=x.device) * J  # (num_graphs,)
-        edge_batch = self.edge_index.unsqueeze(1).expand(
-            -1, num_graphs, -1
-        )  # (2, G, E)
-        edge_batch = edge_batch + offsets.view(1, -1, 1)  # (2, G, E)
-        edge_flat = edge_batch.reshape(2, num_graphs * E)  # (2, G*E)
+        offsets = torch.arange(num_graphs, device=x.device) * J
+        edge_batch = self.edge_index.unsqueeze(1).expand(-1, num_graphs, -1)
+        edge_batch = edge_batch + offsets.view(1, -1, 1)
+        edge_flat = edge_batch.reshape(2, num_graphs * E)
 
-        # batch_tensor: maps each node to its graph index
         batch_tensor = torch.arange(num_graphs, device=x.device).repeat_interleave(J)
 
-        # ── GAT layer 1 ────────────────────────────────────────────────────
-        h = self.gat1(x_nodes, edge_flat)  # (B*T*J, gat_hidden)
+        h = self.gat1(x_nodes, edge_flat)
         h = self.bn1(h)
         h = F.elu(h)
         h = F.dropout(h, p=self.gat_dropout, training=self.training)
 
-        # ── GAT layer 2 ────────────────────────────────────────────────────
         h = self.gat2(h, edge_flat)
         h = self.bn2(h)
         h = F.elu(h)
         h = F.dropout(h, p=self.gat_dropout, training=self.training)
 
-        # ── GAT layer 3 ────────────────────────────────────────────────────
         h = self.gat3(h, edge_flat)
         h = self.bn3(h)
         h = F.elu(h)
 
-        # Global mean pool: (B*T*J, gat_hidden) → (B*T, gat_hidden)
         spatial = global_mean_pool(h, batch_tensor)
+        return spatial.reshape(B, T, self.gat_hidden)
 
-        return spatial.reshape(B, T, self.gat_hidden)  # (B, T, gat_hidden)
+    def _forward_transformer(self, h: torch.Tensor) -> torch.Tensor:
+        """Temporal forward for baseline transformer path."""
+        if self.pos_enc is None or self.transformer is None:
+            raise RuntimeError("Transformer temporal modules are not initialised.")
+        B = h.shape[0]
+        cls = self.cls_token.expand(B, -1, -1)
+        h = torch.cat([cls, h], dim=1)
+        h = self.pos_enc(h)
+        h = self.transformer(h)
+        h = self.norm(h)
+        return h[:, 0, :]
 
-    # ── Forward pass ──────────────────────────────────────────────────────────
+    def _forward_perceiver(self, h: torch.Tensor) -> torch.Tensor:
+        """Temporal forward for Perceiver latent bottleneck path."""
+        if self.latents is None or self.perceiver_layers is None:
+            raise RuntimeError("Perceiver temporal modules are not initialised.")
+        if self.pos_enc is not None:
+            h = self.pos_enc(h)
+
+        B = h.shape[0]
+        latents = self.latents.expand(B, -1, -1)
+        for layer in self.perceiver_layers:
+            latents = layer(latents, h)
+
+        latents = self.norm(latents)
+        return latents[:, 0, :]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -238,52 +513,27 @@ class SpatioTemporalEncoder(nn.Module):
 
         Parameters
         ----------
-        x : torch.Tensor  shape (B, T, J, F)
-            Joint features: pos + vel + acc (F = 9).
+        x : torch.Tensor
+            Shape (B, T, J, F).
 
         Returns
         -------
-        cls_embedding : torch.Tensor  shape (B, d_model)
-            Sequence-level representation extracted from the CLS token.
+        cls_embedding : torch.Tensor
+            Shape (B, d_model).
         """
-        B = x.shape[0]
+        spatial = self._gat_forward(x)
+        h = self.input_proj(spatial)
 
-        # Stage 1: spatial encoding (time-distributed GAT)
-        spatial = self._gat_forward(x)  # (B, T, gat_hidden)
-
-        # Stage 2: temporal encoding
-        h = self.input_proj(spatial)  # (B, T, d_model)
-
-        # Prepend CLS token
-        cls = self.cls_token.expand(B, -1, -1)  # (B, 1, d_model)
-        h = torch.cat([cls, h], dim=1)  # (B, T+1, d_model)
-
-        # Positional encoding
-        h = self.pos_enc(h)  # (B, T+1, d_model)
-
-        # Transformer encoder
-        h = self.transformer(h)  # (B, T+1, d_model)
-        h = self.norm(h)
-
-        # Extract CLS token (position 0)
-        return h[:, 0, :]  # (B, d_model)
+        if self.temporal_backbone == "transformer":
+            return self._forward_transformer(h)
+        return self._forward_perceiver(h)
 
 
-# ── ActionClassifier ──────────────────────────────────────────────────────────
+# -- ActionClassifier ----------------------------------------------------------
 
 
 class ActionClassifier(nn.Module):
-    """
-    Full pretraining model: SpatioTemporalEncoder + linear classification head.
-
-    Used only for Stage 1 (ANUBIS action classification pretraining).
-    After pretraining, save encoder.state_dict() and discard the head.
-
-    Parameters
-    ----------
-    encoder     : SpatioTemporalEncoder
-    num_classes : int   number of action classes (102 for ANUBIS)
-    """
+    """SpatioTemporalEncoder + linear classification head."""
 
     def __init__(self, encoder: SpatioTemporalEncoder, num_classes: int) -> None:
         super().__init__()
@@ -291,40 +541,21 @@ class ActionClassifier(nn.Module):
         self.head = nn.Linear(encoder.d_model, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        x : torch.Tensor  shape (B, T, J, F)
-
-        Returns
-        -------
-        logits : torch.Tensor  shape (B, num_classes)
-        """
-        cls_emb = self.encoder(x)  # (B, d_model)
-        return self.head(cls_emb)  # (B, num_classes)
+        cls_emb = self.encoder(x)
+        return self.head(cls_emb)
 
 
-# ── Factory helper ────────────────────────────────────────────────────────────
+# -- Factory helper ------------------------------------------------------------
 
 
 def build_model(
-    cfg: dict, edge_index: torch.Tensor
+    cfg: dict,
+    edge_index: torch.Tensor,
 ) -> Tuple[SpatioTemporalEncoder, ActionClassifier]:
-    """
-    Construct encoder and full classifier from config dict.
-
-    Parameters
-    ----------
-    cfg        : dict               full config loaded from configs/pretrain.yaml
-    edge_index : torch.Tensor (2,E) skeleton edge index
-
-    Returns
-    -------
-    encoder    : SpatioTemporalEncoder
-    classifier : ActionClassifier
-    """
+    """Construct encoder and classifier from config."""
     m = cfg["model"]
     d = cfg["data"]
+
     encoder = SpatioTemporalEncoder(
         num_joints=d["num_joints"],
         in_features=m["in_features"],
@@ -339,6 +570,15 @@ def build_model(
         dropout=m["transformer_dropout"],
         seq_len=d["seq_len"],
         cls_std=m["cls_std"],
+        temporal_backbone=m.get("temporal_backbone", "transformer"),
+        positional_encoding=m.get("positional_encoding", "sinusoidal"),
+        num_latents=m.get("num_latents", 64),
+        num_perceiver_layers=m.get("num_perceiver_layers", 2),
+        cross_attn_heads=m.get("cross_attn_heads", m["nhead"]),
+        self_attn_heads=m.get("self_attn_heads", m["nhead"]),
+        perceiver_dim_ff=m.get("perceiver_dim_feedforward", m["dim_feedforward"]),
+        perceiver_dropout=m.get("perceiver_dropout", m["transformer_dropout"]),
+        rope_base=m.get("rope_base", 10000.0),
     )
     classifier = ActionClassifier(encoder, num_classes=d["num_classes"])
     total = sum(p.numel() for p in classifier.parameters() if p.requires_grad)
@@ -346,7 +586,8 @@ def build_model(
     return encoder, classifier
 
 
-# ── Quick sanity check ────────────────────────────────────────────────────────
+# -- Quick sanity check --------------------------------------------------------
+
 
 if __name__ == "__main__":
     from module1.data.joint_config import EDGE_INDEX, NUM_JOINTS
@@ -360,12 +601,10 @@ if __name__ == "__main__":
         edge_index=EDGE_INDEX,
         seq_len=T,
     ).to(device)
-
     classifier = ActionClassifier(encoder, num_classes=102).to(device)
     classifier.eval()
 
     dummy = torch.randn(B, T, J, F_IN, device=device)
-
     with torch.no_grad():
         cls_emb = encoder(dummy)
         logits = classifier(dummy)

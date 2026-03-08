@@ -81,6 +81,14 @@ uv run module1/pretrain/tune_optuna.py --config configs/pretrain.yaml --timeout-
 uv run module1/pretrain/train.py --config outputs/logs/pretrain_optuna_best.yaml
 ```
 
+### Train Perceiver + RoPE Experiment
+
+```bash
+uv run module1/pretrain/train.py --config configs/pretrain_perceiver_rope.yaml
+```
+
+Note: checkpoints from Transformer and Perceiver variants are not interchangeable.
+
 ---
 
 ## Evaluation
@@ -93,6 +101,9 @@ uv run module1/pretrain/evaluate.py --config configs/pretrain.yaml --ckpt output
 
 # With t-SNE visualization
 uv run module1/pretrain/evaluate.py --config configs/pretrain.yaml --ckpt outputs/checkpoints/pretrain/pretrain_best.pt --tsne
+
+# Perceiver + RoPE checkpoint evaluation
+uv run module1/pretrain/evaluate.py --config configs/pretrain_perceiver_rope.yaml --ckpt outputs/checkpoints/pretrain/pretrain_best.pt --split val --tsne
 ```
 
 ### Evaluate with Final Pretraining Config

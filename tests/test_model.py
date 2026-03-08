@@ -1,7 +1,7 @@
 # tests/test_model.py
 #
 # Unit tests for module1/pretrain/model.py
-# ──────────────────────────────────────────
+# ------------------------------------------
 # Covers: PositionalEncoding, SpatioTemporalEncoder (forward pass shapes,
 #         no NaNs, edge_index buffer device movement), ActionClassifier
 #         (forward pass, logit shape), and encoder/classifier separation.
@@ -15,13 +15,15 @@ import torch.nn as nn
 from module1.data.joint_config import EDGE_INDEX, NUM_JOINTS
 from module1.pretrain.model import (
     ActionClassifier,
+    MultiHeadAttention,
     PositionalEncoding,
+    RotaryEmbedding,
     SpatioTemporalEncoder,
     build_model,
 )
 
 
-# ── Constants used across tests ───────────────────────────────────────────────
+# -- Constants used across tests ------------------------------------------------
 
 B = 2  # batch size (small to keep tests fast)
 T = 60  # sequence length (frames)
@@ -31,7 +33,7 @@ D_MODEL = 128
 NUM_CLASSES = 102
 
 
-# ── Fixtures ──────────────────────────────────────────────────────────────────
+# -- Fixtures -------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -96,7 +98,7 @@ def minimal_cfg() -> dict:
     }
 
 
-# ── PositionalEncoding ────────────────────────────────────────────────────────
+# -- PositionalEncoding ---------------------------------------------------------
 
 
 class TestPositionalEncoding:
@@ -129,7 +131,57 @@ class TestPositionalEncoding:
         assert not torch.allclose(out[0, 0, :], out[0, 1, :])
 
 
-# ── SpatioTemporalEncoder ─────────────────────────────────────────────────────
+class TestRotaryEmbedding:
+    def test_cos_sin_shape(self) -> None:
+        rope = RotaryEmbedding(dim=32, base=10000.0)
+        cos, sin = rope.get_cos_sin(
+            seq_len=10,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        assert cos.shape == (1, 1, 10, 32)
+        assert sin.shape == (1, 1, 10, 32)
+
+    def test_rejects_odd_dimension(self) -> None:
+        with pytest.raises(ValueError):
+            _ = RotaryEmbedding(dim=31)
+
+
+class TestMultiHeadAttention:
+    @torch.no_grad()
+    def test_self_attention_shape(self) -> None:
+        attn = MultiHeadAttention(d_model=D_MODEL, nhead=4, dropout=0.0)
+        x = torch.randn(B, T, D_MODEL)
+        out = attn(x)
+        assert out.shape == (B, T, D_MODEL)
+
+    @torch.no_grad()
+    def test_cross_attention_shape(self) -> None:
+        attn = MultiHeadAttention(
+            d_model=D_MODEL,
+            nhead=4,
+            dropout=0.0,
+            cross_attention=True,
+            use_rope=True,
+        )
+        q = torch.randn(B, 8, D_MODEL)
+        ctx = torch.randn(B, T, D_MODEL)
+        out = attn(q, context=ctx)
+        assert out.shape == (B, 8, D_MODEL)
+
+    def test_cross_attention_requires_context(self) -> None:
+        attn = MultiHeadAttention(
+            d_model=D_MODEL,
+            nhead=4,
+            dropout=0.0,
+            cross_attention=True,
+        )
+        x = torch.randn(B, 8, D_MODEL)
+        with pytest.raises(ValueError):
+            _ = attn(x)
+
+
+# -- SpatioTemporalEncoder ------------------------------------------------------
 
 
 class TestSpatioTemporalEncoder:
@@ -198,7 +250,7 @@ class TestSpatioTemporalEncoder:
         encoder.eval()
 
 
-# ── ActionClassifier ──────────────────────────────────────────────────────────
+# -- ActionClassifier -----------------------------------------------------------
 
 
 class TestActionClassifier:
@@ -222,7 +274,7 @@ class TestActionClassifier:
     def test_logits_are_unnormalised(
         self, classifier: ActionClassifier, dummy_input: torch.Tensor
     ) -> None:
-        # The head is a plain Linear — softmax probabilities should NOT sum to 1
+        # The head is a plain Linear - softmax probabilities should NOT sum to 1
         logits = classifier(dummy_input)
         row_sums = logits.softmax(dim=-1).sum(dim=-1)
         # After softmax they should sum to ~1, but raw logits sum should not
@@ -245,7 +297,7 @@ class TestActionClassifier:
         assert head_ids.isdisjoint(enc_ids), "Head parameters appear in encoder"
 
 
-# ── build_model factory ───────────────────────────────────────────────────────
+# -- build_model factory --------------------------------------------------------
 
 
 class TestBuildModel:
@@ -261,6 +313,43 @@ class TestBuildModel:
     @torch.no_grad()
     def test_forward_pass_after_build(self, minimal_cfg: dict) -> None:
         _, classifier = build_model(minimal_cfg, EDGE_INDEX)
+        classifier.eval()
+        dummy = torch.randn(B, T, J, F_IN)
+        logits = classifier(dummy)
+        assert logits.shape == (B, NUM_CLASSES)
+        assert not torch.isnan(logits).any()
+
+    @torch.no_grad()
+    def test_perceiver_rope_forward_after_build(self, minimal_cfg: dict) -> None:
+        cfg = {
+            "data": {
+                "num_joints": J,
+                "seq_len": T,
+                "num_classes": NUM_CLASSES,
+            },
+            "model": {
+                "in_features": F_IN,
+                "gat_hidden_dim": 64,
+                "gat_heads": 4,
+                "gat_dropout": 0.0,
+                "d_model": D_MODEL,
+                "nhead": 4,
+                "num_transformer_layers": 2,
+                "dim_feedforward": 256,
+                "transformer_dropout": 0.0,
+                "cls_std": 0.02,
+                "temporal_backbone": "perceiver",
+                "positional_encoding": "rope",
+                "num_latents": 16,
+                "num_perceiver_layers": 2,
+                "cross_attn_heads": 4,
+                "self_attn_heads": 4,
+                "perceiver_dim_feedforward": 256,
+                "perceiver_dropout": 0.0,
+                "rope_base": 10000.0,
+            },
+        }
+        _, classifier = build_model(cfg, EDGE_INDEX)
         classifier.eval()
         dummy = torch.randn(B, T, J, F_IN)
         logits = classifier(dummy)

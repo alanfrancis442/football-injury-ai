@@ -73,6 +73,9 @@ uv run module1/pretrain/train.py --config configs/pretrain.yaml
 # Train final pretraining config (official val split)
 uv run module1/pretrain/train.py --config configs/pretrain_final.yaml
 
+# Train Perceiver + RoPE experiment
+uv run module1/pretrain/train.py --config configs/pretrain_perceiver_rope.yaml
+
 # Evaluate
 uv run module1/pretrain/evaluate.py --config configs/pretrain.yaml --ckpt outputs/checkpoints/pretrain/pretrain_best.pt
 

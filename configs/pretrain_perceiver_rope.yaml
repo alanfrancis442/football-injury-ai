@@ -1,0 +1,117 @@
+# configs/pretrain_perceiver_rope.yaml
+#
+# Stage 1 - ANUBIS Pretraining (Perceiver + RoPE)
+# ------------------------------------------------
+# Experimental architecture config:
+#   - same data/training defaults as pretrain_final.yaml
+#   - temporal backbone switched from Transformer to Perceiver latent bottleneck
+#   - positional encoding switched to RoPE
+
+# -- Data ----------------------------------------------------------------------
+data:
+  anubis_dir:         data/anubis/
+
+  train_features:     trn_features_cleaned.npy
+  train_labels:       trn_labels_cleaned.npy
+  val_features:       val_features_cleaned.npy
+  val_labels:         val_labels_cleaned.npy
+
+  has_separate_val:   true
+  val_split:          0.15
+
+  num_classes:        102
+  num_joints:         32
+  clip_frames:        60
+  seq_len:            60
+
+# -- Model ---------------------------------------------------------------------
+model:
+  in_features:                 9
+  gat_hidden_dim:             64
+  gat_heads:                   4
+  gat_dropout:                 0.051065527924036666
+  d_model:                   128
+  nhead:                       4
+  num_transformer_layers:      2
+  dim_feedforward:           256
+  transformer_dropout:         0.22439178858315353
+  cls_std:                     0.02
+
+  temporal_backbone:         perceiver
+  positional_encoding:       rope
+  num_latents:               64
+  num_perceiver_layers:       2
+  cross_attn_heads:           4
+  self_attn_heads:            4
+  perceiver_dim_feedforward: 256
+  perceiver_dropout:          0.22439178858315353
+  rope_base:               10000.0
+
+# -- Training ------------------------------------------------------------------
+training:
+  epochs:                80
+  batch_size:            64
+  learning_rate:         0.0019464623176755585
+  weight_decay:          0.00020433313066500611
+  warmup_epochs:         5
+  grad_clip_norm:        1.0
+  label_smoothing:       0.040048660941805404
+  save_every_n_epochs:   10
+
+# -- Augmentation --------------------------------------------------------------
+augmentation:
+  enabled:               true
+  flip_prob:             0.39576557171375976
+  joint_jitter_std:      0.0020494388932778985
+  speed_perturb:         true
+  speed_range:           [0.9, 1.1]
+
+# -- Paths ---------------------------------------------------------------------
+paths:
+  checkpoint_dir:  outputs/checkpoints/pretrain/
+  log_dir:         outputs/logs/
+
+# -- Optuna (disabled for this fixed experiment config) ------------------------
+optuna:
+  enabled:          false
+  study_name:       anubis_pretrain_hpo
+  direction:        maximize
+  n_trials:         30
+  timeout_sec:      null
+  trial_epochs:     25
+  seed:             42
+  num_workers:      4
+  pin_memory:       true
+  storage:          null
+  load_if_exists:   true
+
+  output_best_params: outputs/logs/optuna_best_params.yaml
+  output_best_config: outputs/logs/pretrain_optuna_best.yaml
+
+  search_space:
+    learning_rate:
+      low: 0.0001
+      high: 0.002
+      log: true
+    weight_decay:
+      low: 0.00001
+      high: 0.001
+      log: true
+    label_smoothing:
+      low: 0.0
+      high: 0.15
+    gat_dropout:
+      low: 0.05
+      high: 0.35
+    transformer_dropout:
+      low: 0.05
+      high: 0.35
+    flip_prob:
+      low: 0.1
+      high: 0.6
+    joint_jitter_std:
+      low: 0.001
+      high: 0.02
+      log: true
+    speed_perturb:
+      choices: [true, false]
