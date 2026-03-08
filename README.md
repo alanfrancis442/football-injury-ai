@@ -93,3 +93,24 @@ pytest tests/
 2. **Port clean code** into the matching `module1/` file once it works
 3. **Adjust hyperparameters** in `configs/module1.yaml` — never hardcode them
 4. **Verify nothing broke** with `pytest tests/`
+
+---
+
+## Optuna Hyperparameter Tuning (Stage 1)
+
+Run Optuna search for ANUBIS pretraining:
+
+```bash
+uv run module1/pretrain/tune_optuna.py --config configs/pretrain.yaml --n-trials 30
+```
+
+Outputs written to:
+
+- `outputs/logs/optuna_best_params.yaml`
+- `outputs/logs/pretrain_optuna_best.yaml`
+
+Then run full pretraining with the tuned config:
+
+```bash
+uv run module1/pretrain/train.py --config outputs/logs/pretrain_optuna_best.yaml
+```

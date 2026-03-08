@@ -65,3 +65,49 @@ augmentation:
 paths:
   checkpoint_dir:  outputs/checkpoints/pretrain/
   log_dir:         outputs/logs/
+
+# ── Optuna Hyperparameter Search ──────────────────────────────────────────────
+optuna:
+  enabled:          false
+  study_name:       anubis_pretrain_hpo
+  direction:        maximize
+  n_trials:         30
+  timeout_sec:      null
+  trial_epochs:     25
+  seed:             42
+  num_workers:      4
+  pin_memory:       true
+  storage:          null
+  load_if_exists:   true
+
+  output_best_params: outputs/logs/optuna_best_params.yaml
+  output_best_config: outputs/logs/pretrain_optuna_best.yaml
+
+  # Optional overrides for sampling ranges
+  search_space:
+    learning_rate:
+      low: 0.0001
+      high: 0.002
+      log: true
+    weight_decay:
+      low: 0.00001
+      high: 0.001
+      log: true
+    label_smoothing:
+      low: 0.0
+      high: 0.15
+    gat_dropout:
+      low: 0.05
+      high: 0.35
+    transformer_dropout:
+      low: 0.05
+      high: 0.35
+    flip_prob:
+      low: 0.1
+      high: 0.6
+    joint_jitter_std:
+      low: 0.001
+      high: 0.02
+      log: true
+    speed_perturb:
+      choices: [true, false]

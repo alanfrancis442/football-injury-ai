@@ -30,6 +30,7 @@ dependencies = [
     # Evaluation & Utilities
     "scikit-learn>=1.3",
     "tqdm>=4.65",
+    "optuna>=3.6",
 
     # Notebooks
     "jupyter>=1.0",
