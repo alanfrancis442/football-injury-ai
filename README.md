@@ -70,8 +70,14 @@ uv pip install torch-scatter torch-sparse -f https://data.pyg.org/whl/torch-2.1.
 # Train ANUBIS pretraining
 uv run module1/pretrain/train.py --config configs/pretrain.yaml
 
+# Train final pretraining config (official val split)
+uv run module1/pretrain/train.py --config configs/pretrain_final.yaml
+
 # Evaluate
 uv run module1/pretrain/evaluate.py --config configs/pretrain.yaml --ckpt outputs/checkpoints/pretrain/pretrain_best.pt
+
+# Live webcam/video action test
+uv run module1/pretrain/live_inference.py --config configs/pretrain_final.yaml --ckpt outputs/checkpoints/pretrain/pretrain_best.pt --source 0
 
 # Run Optuna tuning
 uv run module1/pretrain/tune_optuna.py --config configs/pretrain.yaml --n-trials 30

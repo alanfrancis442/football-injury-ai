@@ -95,6 +95,12 @@ uv run module1/pretrain/evaluate.py --config configs/pretrain.yaml --ckpt output
 uv run module1/pretrain/evaluate.py --config configs/pretrain.yaml --ckpt outputs/checkpoints/pretrain/pretrain_best.pt --tsne
 ```
 
+### Evaluate with Final Pretraining Config
+
+```bash
+uv run module1/pretrain/evaluate.py --config configs/pretrain_final.yaml --ckpt outputs/checkpoints/pretrain/pretrain_best.pt --split val --tsne
+```
+
 ### Checkpoint Locations
 
 | Checkpoint | Path |
@@ -106,6 +112,39 @@ uv run module1/pretrain/evaluate.py --config configs/pretrain.yaml --ckpt output
 ---
 
 ## Testing
+
+### Live Inference (Webcam / Video / RTSP)
+
+This tests the pretrained ANUBIS action model on live footage.
+
+```bash
+# Webcam (index 0)
+uv run module1/pretrain/live_inference.py --config configs/pretrain_final.yaml --ckpt outputs/checkpoints/pretrain/pretrain_best.pt --source 0
+
+# Video file
+uv run module1/pretrain/live_inference.py --config configs/pretrain_final.yaml --ckpt outputs/checkpoints/pretrain/pretrain_best.pt --source data/samples/clip.mp4
+
+# RTSP stream
+uv run module1/pretrain/live_inference.py --config configs/pretrain_final.yaml --ckpt outputs/checkpoints/pretrain/pretrain_best.pt --source "rtsp://<user>:<pass>@<ip>:554/stream"
+```
+
+Optional flags:
+
+```bash
+# Show top-3 classes only
+uv run module1/pretrain/live_inference.py --source 0 --topk 3
+
+# Stronger prediction smoothing
+uv run module1/pretrain/live_inference.py --source 0 --smooth-alpha 0.85
+
+# Use custom class names (.txt/.yaml/.json)
+uv run module1/pretrain/live_inference.py --source 0 --label-map outputs/logs/anubis_class_names.txt
+
+# Headless mode (no OpenCV window)
+uv run module1/pretrain/live_inference.py --source data/samples/clip.mp4 --no-show
+```
+
+Exit live mode with `q` or `Esc`.
 
 ### Run All Tests
 
@@ -119,6 +158,7 @@ uv run pytest tests/
 uv run pytest tests/test_model.py -v
 uv run pytest tests/test_anubis_loader.py -v
 uv run pytest tests/test_joint_config.py -v
+uv run pytest tests/test_live_pipeline.py -v
 ```
 
 ### Run Single Test
@@ -146,8 +186,11 @@ uv run module1/pretrain/model.py
 football-injury-ai/
 ├── module1/
 │   ├── data/              # Data loading & preprocessing
+│   ├── pose/              # Live pose extraction (MediaPipe -> ANUBIS-32)
 │   ├── pretrain/          # Training & evaluation scripts
-│   └── pose/              # Pose extraction (future)
+│   │   ├── live_inference.py
+│   │   └── live_utils.py
+│   └── ...
 ├── configs/
 │   ├── pretrain.yaml      # ANUBIS pretraining config
 │   └── module1.yaml       # Fine-tuning config
@@ -190,6 +233,12 @@ rm outputs/checkpoints/pretrain/pretrain_ep*.pt
 ## Troubleshooting
 
 ### "No module named 'torch'"
+
+```bash
+uv sync
+```
+
+### "No module named 'cv2'" or "No module named 'mediapipe'"
 
 ```bash
 uv sync
