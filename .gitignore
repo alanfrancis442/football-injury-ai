@@ -18,6 +18,7 @@ env/
 data/raw/
 data/processed/
 data/samples/
+data/anubis/
 
 # Model outputs
 outputs/checkpoints/
