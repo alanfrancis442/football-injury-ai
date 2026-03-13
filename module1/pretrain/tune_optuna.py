@@ -6,7 +6,8 @@
 # ActionClassifier training loop.
 #
 # Usage:
-#   python module1/pretrain/tune_optuna.py --config configs/pretrain.yaml
+#   python module1/pretrain/tune_optuna.py \
+#       --config configs/experiments/module1/baseline_transformer.yaml
 #
 # Notes:
 #   - This script does NOT save per-trial model checkpoints.
@@ -18,41 +19,26 @@ from __future__ import annotations
 import argparse
 import copy
 import os
-import random
 from typing import Any, Callable, Dict, Optional
 
-import numpy as np
 import torch
 import torch.nn as nn
 import yaml
 
 from module1.data.anubis_loader import build_dataloaders
 from module1.data.joint_config import EDGE_INDEX
+from module1.pretrain.experiments import (
+    ensure_experiment_dirs,
+    prepare_experiment_config,
+    resolve_artifact_path,
+    set_seed,
+)
 from module1.pretrain.model import build_model
 from module1.pretrain.train import _make_lr_lambda, evaluate, train_one_epoch
 from utils.config import load_config
 from utils.logger import get_logger
 
 log = get_logger(__name__)
-
-
-# ── Reproducibility helpers ───────────────────────────────────────────────────
-
-
-def set_seed(seed: int) -> None:
-    """
-    Set random seeds for reproducibility.
-
-    Parameters
-    ----------
-    seed : int
-        Global random seed.
-    """
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
 
 
 # ── Search-space helpers ──────────────────────────────────────────────────────
@@ -274,6 +260,7 @@ def make_objective(base_cfg: Dict, opt_cfg: Dict, device: torch.device) -> Calla
 
         best_val_top1 = 0.0
         best_val_top5 = 0.0
+        best_val_macro_f1 = 0.0
         best_val_loss = float("inf")
         trn_loss = 0.0
         trn_acc = 0.0
@@ -288,7 +275,7 @@ def make_objective(base_cfg: Dict, opt_cfg: Dict, device: torch.device) -> Calla
                 grad_clip,
             )
 
-            val_loss, val_top1, val_top5 = evaluate(
+            val_metrics = evaluate(
                 classifier,
                 val_loader,
                 eval_criterion,
@@ -297,10 +284,11 @@ def make_objective(base_cfg: Dict, opt_cfg: Dict, device: torch.device) -> Calla
 
             scheduler.step()
 
-            if val_top1 > best_val_top1:
-                best_val_top1 = val_top1
-                best_val_top5 = val_top5
-                best_val_loss = val_loss
+            if val_metrics["val_top1"] > best_val_top1:
+                best_val_top1 = float(val_metrics["val_top1"])
+                best_val_top5 = float(val_metrics["val_top5"])
+                best_val_macro_f1 = float(val_metrics["val_macro_f1"])
+                best_val_loss = float(val_metrics["val_loss"])
 
             trial.report(best_val_top1, step=epoch)
             if trial.should_prune():
@@ -308,15 +296,17 @@ def make_objective(base_cfg: Dict, opt_cfg: Dict, device: torch.device) -> Calla
 
         trial.set_user_attr("best_val_top1", float(best_val_top1))
         trial.set_user_attr("best_val_top5", float(best_val_top5))
+        trial.set_user_attr("best_val_macro_f1", float(best_val_macro_f1))
         trial.set_user_attr("best_val_loss", float(best_val_loss))
         trial.set_user_attr("final_trn_loss", float(trn_loss))
         trial.set_user_attr("final_trn_acc", float(trn_acc))
 
         log.info(
-            "Trial %d done | best val top1=%.4f top5=%.4f loss=%.4f",
+            "Trial %d done | best val top1=%.4f top5=%.4f macro_f1=%.4f loss=%.4f",
             trial.number,
             best_val_top1,
             best_val_top5,
+            best_val_macro_f1,
             best_val_loss,
         )
         return float(best_val_top1)
@@ -332,7 +322,9 @@ def main(
     n_trials_override: Optional[int],
     timeout_override: Optional[int],
 ) -> None:
-    cfg = load_config(config_path)
+    raw_cfg = load_config(config_path)
+    cfg, experiment = prepare_experiment_config(raw_cfg, config_path=config_path)
+    ensure_experiment_dirs(experiment)
     opt_cfg = cfg.get("optuna", {})
 
     try:
@@ -363,6 +355,12 @@ def main(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info("Device: %s", device)
     log.info(
+        "Experiment: group=%s name=%s slug=%s",
+        experiment.group,
+        experiment.name,
+        experiment.slug,
+    )
+    log.info(
         "Starting Optuna study '%s' | trials=%d | timeout=%s",
         study_name,
         n_trials,
@@ -391,18 +389,26 @@ def main(
             "No completed trial found. Check your data/configuration."
         ) from exc
     best_params = dict(best_trial.params)
+    best_value = (
+        float(best_trial.value) if best_trial.value is not None else float("nan")
+    )
     log.info("Best trial: %d", best_trial.number)
-    log.info("Best value (val_top1): %.4f", best_trial.value)
+    log.info("Best value (val_top1): %.4f", best_value)
     log.info("Best params: %s", best_params)
 
     best_cfg = copy.deepcopy(cfg)
     apply_hparams(best_cfg, best_params)
-
-    best_params_path = str(
-        opt_cfg.get("output_best_params", "outputs/logs/optuna_best_params.yaml")
+    best_cfg.setdefault("experiment", {})["name"] = (
+        f"{best_cfg['experiment'].get('name', 'baseline_transformer')}_optuna_best"
     )
-    best_cfg_path = str(
-        opt_cfg.get("output_best_config", "outputs/logs/pretrain_optuna_best.yaml")
+
+    best_params_path = resolve_artifact_path(
+        experiment.log_dir,
+        str(opt_cfg.get("output_best_params", "optuna_best_params.yaml")),
+    )
+    best_cfg_path = resolve_artifact_path(
+        experiment.log_dir,
+        str(opt_cfg.get("output_best_config", "pretrain_optuna_best.yaml")),
     )
 
     save_yaml(
@@ -410,7 +416,7 @@ def main(
         {
             "study_name": study_name,
             "best_trial_number": int(best_trial.number),
-            "best_value": float(best_trial.value),
+            "best_value": best_value,
             "best_params": best_params,
             "best_user_attrs": dict(best_trial.user_attrs),
         },
@@ -427,8 +433,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--config",
-        default="configs/pretrain.yaml",
-        help="Path to pretrain config YAML",
+        default="configs/experiments/module1/baseline_transformer.yaml",
+        help="Path to experiment config YAML",
     )
     parser.add_argument(
         "--n-trials",

@@ -1,51 +1,44 @@
-                                                            # module1/pretrain/train.py
+# module1/pretrain/train.py
 #
 # Stage 1 — ANUBIS Pretraining Loop
 # ──────────────────────────────────
-# Trains ActionClassifier end-to-end on ANUBIS 102-class action recognition.
-# LR schedule: linear warm-up for warmup_epochs, then cosine annealing.
-# After training, only encoder weights are needed for fine-tuning.
-#
-# Usage:
-#   python module1/pretrain/train.py --config configs/pretrain.yaml
-#
-# Checkpoints are saved to paths.checkpoint_dir:
-#   pretrain_best.pt     — best validation loss
-#   pretrain_ep{N}.pt    — periodic saves every save_every_n_epochs epochs
+# Trains the Stage 1 ActionClassifier on ANUBIS and stores experiment-scoped
+# checkpoints/metrics so different temporal backbones can be compared cleanly.
 
 from __future__ import annotations
 
 import argparse
 import math
 import os
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 import torch.nn as nn
+from sklearn.metrics import f1_score
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from module1.data.anubis_loader import build_dataloaders
 from module1.data.joint_config import EDGE_INDEX
-from module1.pretrain.model import ActionClassifier, SpatioTemporalEncoder, build_model
+from module1.pretrain.experiments import (
+    ensure_experiment_dirs,
+    prepare_experiment_config,
+    resolve_artifact_path,
+    save_json,
+    set_seed,
+)
+from module1.pretrain.model import ActionClassifier, build_model
 from utils.config import load_config
 from utils.logger import get_logger
 
 log = get_logger(__name__)
 
 
-# ── LR schedule ───────────────────────────────────────────────────────────────
+# ── LR Schedule ───────────────────────────────────────────────────────────────
 
 
 def _make_lr_lambda(warmup_epochs: int, total_epochs: int):
-    """
-    Return a LambdaLR multiplier function implementing linear warm-up followed
-    by cosine annealing.
-
-    Multiplier at epoch e:
-      e < warmup_epochs  →  (e+1) / warmup_epochs   (linear ramp)
-      e >= warmup_epochs →  0.5 * (1 + cos(π * progress))
-    """
+    """Return a linear-warmup + cosine-decay LR multiplier."""
 
     def lr_lambda(epoch: int) -> float:
         if epoch < warmup_epochs:
@@ -58,7 +51,7 @@ def _make_lr_lambda(warmup_epochs: int, total_epochs: int):
     return lr_lambda
 
 
-# ── Training / evaluation functions ──────────────────────────────────────────
+# ── Train / Eval ──────────────────────────────────────────────────────────────
 
 
 def train_one_epoch(
@@ -69,44 +62,28 @@ def train_one_epoch(
     device: torch.device,
     grad_clip: float,
 ) -> Tuple[float, float]:
-    """
-    Run one training epoch.
-
-    Parameters
-    ----------
-    model     : ActionClassifier
-    loader    : DataLoader         training data
-    optimiser : torch.optim.Optimizer
-    criterion : nn.CrossEntropyLoss
-    device    : torch.device
-    grad_clip : float              max_norm for gradient clipping
-
-    Returns
-    -------
-    avg_loss : float   mean CE loss over all batches
-    accuracy : float   top-1 accuracy in [0, 1]
-    """
+    """Run one training epoch and return mean loss and top-1 accuracy."""
     model.train()
     total_loss = 0.0
     total_correct = 0
     total_samples = 0
 
     for x, y in tqdm(loader, desc="  train", leave=False, unit="batch"):
-        x = x.to(device, non_blocking=True)  # (B, T, J, F)
-        y = y.to(device, non_blocking=True)  # (B,)
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
 
         optimiser.zero_grad()
-        logits = model(x)  # (B, num_classes)
+        logits = model(x)
         loss = criterion(logits, y)
         loss.backward()
 
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
         optimiser.step()
 
-        bs = y.size(0)
-        total_loss += loss.item() * bs
+        batch_size = y.size(0)
+        total_loss += loss.item() * batch_size
         total_correct += (logits.argmax(dim=1) == y).sum().item()
-        total_samples += bs
+        total_samples += batch_size
 
     avg_loss = total_loss / total_samples
     accuracy = total_correct / total_samples
@@ -119,127 +96,145 @@ def evaluate(
     loader: DataLoader,
     criterion: nn.CrossEntropyLoss,
     device: torch.device,
-) -> Tuple[float, float, float]:
-    """
-    Evaluate the model on a data split.
-
-    Parameters
-    ----------
-    model     : ActionClassifier
-    loader    : DataLoader
-    criterion : nn.CrossEntropyLoss  (label_smoothing=0 has no effect at eval)
-    device    : torch.device
-
-    Returns
-    -------
-    avg_loss  : float   mean CE loss
-    top1_acc  : float   top-1 accuracy in [0, 1]
-    top5_acc  : float   top-5 accuracy in [0, 1]
-    """
+) -> Dict[str, float]:
+    """Evaluate the model and return classification metrics."""
     model.eval()
     total_loss = 0.0
     total_top1 = 0
     total_top5 = 0
     total_samples = 0
+    preds: List[torch.Tensor] = []
+    labels: List[torch.Tensor] = []
 
     for x, y in tqdm(loader, desc="  val  ", leave=False, unit="batch"):
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
 
-        logits = model(x)  # (B, num_classes)
+        logits = model(x)
         loss = criterion(logits, y)
 
-        bs = y.size(0)
-        total_loss += loss.item() * bs
+        batch_size = y.size(0)
+        total_loss += loss.item() * batch_size
+        pred = logits.argmax(dim=1)
+        total_top1 += (pred == y).sum().item()
 
-        # Top-1
-        total_top1 += (logits.argmax(dim=1) == y).sum().item()
-
-        # Top-5
-        top5_preds = logits.topk(k=min(5, logits.size(1)), dim=1).indices  # (B, 5)
+        top5_preds = logits.topk(k=min(5, logits.size(1)), dim=1).indices
         total_top5 += (top5_preds == y.unsqueeze(1)).any(dim=1).sum().item()
+        total_samples += batch_size
 
-        total_samples += bs
+        preds.append(pred.cpu())
+        labels.append(y.cpu())
 
-    avg_loss = total_loss / total_samples
-    top1_acc = total_top1 / total_samples
-    top5_acc = total_top5 / total_samples
-    return avg_loss, top1_acc, top5_acc
+    pred_np = torch.cat(preds).numpy()
+    label_np = torch.cat(labels).numpy()
+
+    return {
+        "val_loss": total_loss / total_samples,
+        "val_top1": total_top1 / total_samples,
+        "val_top5": total_top5 / total_samples,
+        "val_macro_f1": float(f1_score(label_np, pred_np, average="macro")),
+    }
 
 
-# ── Checkpoint helpers ────────────────────────────────────────────────────────
+# ── Checkpoints ───────────────────────────────────────────────────────────────
+
+
+def _checkpoint_payload(
+    epoch: int,
+    classifier: ActionClassifier,
+    optimiser: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    metrics: Dict[str, float],
+    cfg: Dict,
+) -> Dict:
+    """Build a checkpoint payload that preserves both encoder and classifier."""
+    exp_cfg = cfg.get("experiment", {})
+    return {
+        "epoch": epoch,
+        "model": classifier.state_dict(),
+        "encoder": classifier.encoder.state_dict(),
+        "classifier": classifier.state_dict(),
+        "optimiser": optimiser.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "experiment": {
+            "group": exp_cfg.get("group", "module1"),
+            "name": exp_cfg.get("name", "default"),
+            "slug": exp_cfg.get("slug", "default"),
+        },
+        "config": cfg,
+        **metrics,
+    }
 
 
 def _save_checkpoint(
     path: str,
-    epoch: int,
-    encoder: SpatioTemporalEncoder,
-    classifier: ActionClassifier,
-    optimiser: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LRScheduler,
-    metrics: Dict,
+    payload: Dict,
 ) -> None:
+    """Save a training checkpoint to disk."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    torch.save(
-        {
-            "epoch": epoch,
-            "encoder": encoder.state_dict(),
-            "classifier": classifier.state_dict(),
-            "optimiser": optimiser.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            **metrics,
-        },
-        path,
-    )
+    torch.save(payload, path)
     log.info("Saved checkpoint → %s", path)
 
 
-# ── Main training entry point ─────────────────────────────────────────────────
+# ── Main Entry Point ──────────────────────────────────────────────────────────
 
 
 def main(config_path: str) -> None:
-    cfg = load_config(config_path)
+    raw_cfg = load_config(config_path)
+    cfg, experiment = prepare_experiment_config(raw_cfg, config_path=config_path)
+    ensure_experiment_dirs(experiment)
 
-    # ── Device ──────────────────────────────────────────────────────────────
+    seed = int(cfg.get("experiment", {}).get("seed", 42))
+    set_seed(seed)
+
+    resolved_config_path = os.path.join(experiment.log_dir, "resolved_config.json")
+    save_json(resolved_config_path, cfg)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info("Device: %s", device)
-
-    # ── Data ────────────────────────────────────────────────────────────────
-    log.info("Loading ANUBIS dataset …")
-    train_loader, val_loader = build_dataloaders(cfg)
-
-    # ── Model ───────────────────────────────────────────────────────────────
-    edge_index = EDGE_INDEX.to(device)
-    encoder, classifier = build_model(cfg, edge_index)
-    classifier = classifier.to(device)
-
-    # ── Optimiser ───────────────────────────────────────────────────────────
-    t_cfg = cfg["training"]
-    optimiser = torch.optim.AdamW(
-        classifier.parameters(),
-        lr=t_cfg["learning_rate"],
-        weight_decay=t_cfg["weight_decay"],
+    log.info(
+        "Experiment: group=%s name=%s slug=%s",
+        experiment.group,
+        experiment.name,
+        experiment.slug,
     )
 
-    # Warm-up + cosine LR schedule
-    total_epochs = t_cfg["epochs"]
-    warmup_epochs = t_cfg.get("warmup_epochs", 5)
+    log.info("Loading ANUBIS dataset ...")
+    train_loader, val_loader = build_dataloaders(cfg)
+
+    edge_index = EDGE_INDEX.to(device)
+    _, classifier = build_model(cfg, edge_index)
+    classifier = classifier.to(device)
+
+    train_cfg = cfg["training"]
+    optimiser = torch.optim.AdamW(
+        classifier.parameters(),
+        lr=train_cfg["learning_rate"],
+        weight_decay=train_cfg["weight_decay"],
+    )
+
+    total_epochs = int(train_cfg["epochs"])
+    warmup_epochs = int(train_cfg.get("warmup_epochs", 5))
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimiser,
         lr_lambda=_make_lr_lambda(warmup_epochs, total_epochs),
     )
 
-    # ── Loss ────────────────────────────────────────────────────────────────
-    criterion = nn.CrossEntropyLoss(label_smoothing=t_cfg.get("label_smoothing", 0.1))
-    eval_criterion = nn.CrossEntropyLoss()  # no smoothing for val metrics
+    criterion = nn.CrossEntropyLoss(
+        label_smoothing=float(train_cfg.get("label_smoothing", 0.0))
+    )
+    eval_criterion = nn.CrossEntropyLoss()
 
-    # ── Training loop ────────────────────────────────────────────────────────
-    ckpt_dir = cfg["paths"]["checkpoint_dir"]
-    save_every = t_cfg.get("save_every_n_epochs", 10)
-    grad_clip = t_cfg.get("grad_clip_norm", 1.0)
+    save_every = int(train_cfg.get("save_every_n_epochs", 10))
+    grad_clip = float(train_cfg.get("grad_clip_norm", 1.0))
 
-    best_val_loss = float("inf")
-    best_epoch = 0
+    history: List[Dict[str, float]] = []
+    history_path = os.path.join(experiment.log_dir, "training_history.json")
+
+    best_loss = float("inf")
+    best_top1 = -1.0
+    best_macro_f1 = -1.0
+    best_epochs = {"loss": 0, "top1": 0, "macro_f1": 0}
 
     log.info("Starting pretraining for %d epochs", total_epochs)
 
@@ -247,82 +242,161 @@ def main(config_path: str) -> None:
         current_lr = optimiser.param_groups[0]["lr"]
         log.info("Epoch %d/%d  lr=%.6f", epoch, total_epochs, current_lr)
 
-        # Train
         trn_loss, trn_acc = train_one_epoch(
-            classifier, train_loader, optimiser, criterion, device, grad_clip
+            classifier,
+            train_loader,
+            optimiser,
+            criterion,
+            device,
+            grad_clip,
         )
-
-        # Validate
-        val_loss, val_top1, val_top5 = evaluate(
-            classifier, val_loader, eval_criterion, device
-        )
-
+        val_metrics = evaluate(classifier, val_loader, eval_criterion, device)
         scheduler.step()
 
-        log.info(
-            "  trn loss=%.4f  acc=%.3f | val loss=%.4f  top1=%.3f  top5=%.3f",
-            trn_loss,
-            trn_acc,
-            val_loss,
-            val_top1,
-            val_top5,
+        epoch_metrics = {
+            "epoch": float(epoch),
+            "trn_loss": float(trn_loss),
+            "trn_acc": float(trn_acc),
+            **{key: float(value) for key, value in val_metrics.items()},
+        }
+        history.append(epoch_metrics)
+        save_json(
+            history_path,
+            {
+                "experiment": {
+                    "group": experiment.group,
+                    "name": experiment.name,
+                    "slug": experiment.slug,
+                },
+                "history": history,
+            },
         )
 
-        metrics = {
-            "val_loss": val_loss,
-            "val_top1": val_top1,
-            "val_top5": val_top5,
-            "trn_loss": trn_loss,
-            "trn_acc": trn_acc,
-        }
+        log.info(
+            "  trn loss=%.4f acc=%.3f | val loss=%.4f top1=%.3f top5=%.3f macro_f1=%.3f",
+            trn_loss,
+            trn_acc,
+            val_metrics["val_loss"],
+            val_metrics["val_top1"],
+            val_metrics["val_top5"],
+            val_metrics["val_macro_f1"],
+        )
 
-        # Save best checkpoint
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_epoch = epoch
+        payload = _checkpoint_payload(
+            epoch=epoch,
+            classifier=classifier,
+            optimiser=optimiser,
+            scheduler=scheduler,
+            metrics={key: float(value) for key, value in epoch_metrics.items()},
+            cfg=cfg,
+        )
+
+        _save_checkpoint(
+            os.path.join(experiment.checkpoint_dir, "pretrain_last.pt"), payload
+        )
+
+        if val_metrics["val_loss"] < best_loss:
+            best_loss = float(val_metrics["val_loss"])
+            best_epochs["loss"] = epoch
             _save_checkpoint(
-                os.path.join(ckpt_dir, "pretrain_best.pt"),
-                epoch,
-                encoder,
-                classifier,
-                optimiser,
-                scheduler,
-                metrics,
+                os.path.join(experiment.checkpoint_dir, "pretrain_best_loss.pt"),
+                payload,
             )
-            log.info("  *** New best at epoch %d  val_loss=%.4f ***", epoch, val_loss)
+            log.info(
+                "  *** New best loss at epoch %d  val_loss=%.4f ***", epoch, best_loss
+            )
 
-        # Periodic checkpoint
+        if val_metrics["val_top1"] > best_top1:
+            best_top1 = float(val_metrics["val_top1"])
+            best_epochs["top1"] = epoch
+            best_top1_path = os.path.join(experiment.checkpoint_dir, "pretrain_best.pt")
+            _save_checkpoint(best_top1_path, payload)
+            _save_checkpoint(
+                os.path.join(experiment.checkpoint_dir, "pretrain_best_top1.pt"),
+                payload,
+            )
+            log.info(
+                "  *** New best top1 at epoch %d  val_top1=%.4f ***", epoch, best_top1
+            )
+
+        if val_metrics["val_macro_f1"] > best_macro_f1:
+            best_macro_f1 = float(val_metrics["val_macro_f1"])
+            best_epochs["macro_f1"] = epoch
+            _save_checkpoint(
+                os.path.join(experiment.checkpoint_dir, "pretrain_best_macro_f1.pt"),
+                payload,
+            )
+            log.info(
+                "  *** New best macro F1 at epoch %d  val_macro_f1=%.4f ***",
+                epoch,
+                best_macro_f1,
+            )
+
         if epoch % save_every == 0:
             _save_checkpoint(
-                os.path.join(ckpt_dir, f"pretrain_ep{epoch:04d}.pt"),
-                epoch,
-                encoder,
-                classifier,
-                optimiser,
-                scheduler,
-                metrics,
+                os.path.join(experiment.checkpoint_dir, f"pretrain_ep{epoch:04d}.pt"),
+                payload,
             )
 
-    log.info(
-        "Pretraining complete.  Best epoch: %d  val_loss=%.4f",
-        best_epoch,
-        best_val_loss,
-    )
-    log.info(
-        "Encoder weights saved in:  %s/pretrain_best.pt  (key: 'encoder')", ckpt_dir
+    summary_path = os.path.join(experiment.log_dir, "training_summary.json")
+    save_json(
+        summary_path,
+        {
+            "experiment": {
+                "group": experiment.group,
+                "name": experiment.name,
+                "slug": experiment.slug,
+            },
+            "best": {
+                "loss": {"epoch": best_epochs["loss"], "value": best_loss},
+                "top1": {"epoch": best_epochs["top1"], "value": best_top1},
+                "macro_f1": {
+                    "epoch": best_epochs["macro_f1"],
+                    "value": best_macro_f1,
+                },
+            },
+            "artifacts": {
+                "best_top1": resolve_artifact_path(
+                    experiment.checkpoint_dir,
+                    "pretrain_best.pt",
+                ),
+                "best_loss": resolve_artifact_path(
+                    experiment.checkpoint_dir,
+                    "pretrain_best_loss.pt",
+                ),
+                "best_macro_f1": resolve_artifact_path(
+                    experiment.checkpoint_dir,
+                    "pretrain_best_macro_f1.pt",
+                ),
+                "last": resolve_artifact_path(
+                    experiment.checkpoint_dir,
+                    "pretrain_last.pt",
+                ),
+            },
+        },
     )
 
+    log.info(
+        "Pretraining complete. Best top1 epoch=%d top1=%.4f | best macro_f1 epoch=%d macro_f1=%.4f | best loss epoch=%d loss=%.4f",
+        best_epochs["top1"],
+        best_top1,
+        best_epochs["macro_f1"],
+        best_macro_f1,
+        best_epochs["loss"],
+        best_loss,
+    )
+    log.info("Experiment checkpoints: %s", experiment.checkpoint_dir)
+    log.info("Experiment logs: %s", experiment.log_dir)
 
-# ── CLI entry point ───────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Pretrain SpatioTemporalEncoder on ANUBIS"
+        description="Pretrain the Stage 1 ActionClassifier on ANUBIS"
     )
     parser.add_argument(
         "--config",
-        default="configs/pretrain.yaml",
-        help="Path to pretrain config YAML",
+        default="configs/experiments/module1/baseline_transformer.yaml",
+        help="Path to experiment config YAML",
     )
     args = parser.parse_args()
     main(args.config)

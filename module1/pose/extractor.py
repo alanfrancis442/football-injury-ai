@@ -4,9 +4,13 @@
 # --------------------------------------------------------
 # Converts MediaPipe Pose (33 landmarks) into the repository's 32-joint
 # skeleton format used by the pretraining model.
+# Uses MediaPipe Tasks API (PoseLandmarker) for compatibility with
+# mediapipe >= 0.10.31.
 
 from __future__ import annotations
 
+import os
+import urllib.request
 from typing import Any, Optional
 
 import cv2
@@ -15,6 +19,16 @@ import numpy as np
 from utils.logger import get_logger
 
 log = get_logger(__name__)
+
+# Default pose landmarker model (lite); downloaded on first use if missing.
+POSE_LANDMARKER_URL = (
+    "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+    "pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
+)
+DEFAULT_MODEL_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data", "models"
+)
+DEFAULT_MODEL_PATH = os.path.join(DEFAULT_MODEL_DIR, "pose_landmarker_lite.task")
 
 
 NUM_MEDIAPIPE_JOINTS = 33
@@ -138,6 +152,17 @@ def mediapipe33_to_anubis32(keypoints_33: np.ndarray) -> np.ndarray:
     return out
 
 
+def _get_pose_landmarker_model_path(path: Optional[str] = None) -> str:
+    """Return path to pose_landmarker .task file, downloading it if missing."""
+    model_path = path or DEFAULT_MODEL_PATH
+    if os.path.isfile(model_path):
+        return model_path
+    os.makedirs(os.path.dirname(model_path), exist_ok=True)
+    log.info("Downloading pose_landmarker model to %s ...", model_path)
+    urllib.request.urlretrieve(POSE_LANDMARKER_URL, model_path)
+    return model_path
+
+
 class PoseExtractor:
     """
     Lightweight MediaPipe Pose wrapper for frame-wise extraction.
@@ -153,37 +178,43 @@ class PoseExtractor:
         min_detection_confidence: float = 0.5,
         min_tracking_confidence: float = 0.5,
         model_complexity: int = 1,
+        model_path: Optional[str] = None,
     ) -> None:
         self.min_detection_confidence = float(min_detection_confidence)
         self.min_tracking_confidence = float(min_tracking_confidence)
         self.model_complexity = int(model_complexity)
+        self.model_path = model_path
 
-        self._mp_pose: Optional[Any] = None
-        self._pose: Optional[Any] = None
+        self._landmarker: Optional[Any] = None
+        self._timestamp_ms: int = 0
 
     def __enter__(self) -> "PoseExtractor":
         try:
             import mediapipe as mp
+            from mediapipe.tasks import python as mp_tasks
+            from mediapipe.tasks.python import vision
         except ImportError as exc:
             raise ImportError(
                 "mediapipe is not installed. Install dependencies and retry."
             ) from exc
 
-        self._mp_pose = mp.solutions.pose
-        self._pose = self._mp_pose.Pose(
-            static_image_mode=False,
-            model_complexity=self.model_complexity,
-            smooth_landmarks=True,
-            min_detection_confidence=self.min_detection_confidence,
+        model_path = _get_pose_landmarker_model_path(self.model_path)
+        base_options = mp_tasks.BaseOptions(model_asset_path=model_path)
+        options = vision.PoseLandmarkerOptions(
+            base_options=base_options,
+            running_mode=vision.RunningMode.VIDEO,
+            num_poses=1,
+            min_pose_detection_confidence=self.min_detection_confidence,
             min_tracking_confidence=self.min_tracking_confidence,
         )
+        self._landmarker = vision.PoseLandmarker.create_from_options(options)
+        self._timestamp_ms = 0
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        if self._pose is not None:
-            self._pose.close()
-        self._pose = None
-        self._mp_pose = None
+        if self._landmarker is not None:
+            self._landmarker.close()
+        self._landmarker = None
 
     def extract_from_frame(self, frame_bgr: np.ndarray) -> Optional[np.ndarray]:
         """
@@ -198,20 +229,31 @@ class PoseExtractor:
         joints_32 : np.ndarray  shape (32, 3), optional
             None if no pose is detected in this frame.
         """
-        if self._pose is None:
+        if self._landmarker is None:
             raise RuntimeError(
                 "PoseExtractor is not initialised. Use it as a context manager."
             )
 
+        import mediapipe as mp
+
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        results = self._pose.process(frame_rgb)
-        if results.pose_landmarks is None:
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+        result = self._landmarker.detect_for_video(mp_image, self._timestamp_ms)
+        self._timestamp_ms += 1
+
+        if not result.pose_landmarks:
             return None
 
+        landmarks = result.pose_landmarks[0]
         keypoints_33 = np.array(
             [
-                [lm.x, lm.y, lm.z, lm.visibility]
-                for lm in results.pose_landmarks.landmark
+                [
+                    lm.x,
+                    lm.y,
+                    lm.z,
+                    lm.visibility if lm.visibility is not None else 1.0,
+                ]
+                for lm in landmarks
             ],
             dtype=np.float32,
         )

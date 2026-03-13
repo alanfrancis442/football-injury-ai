@@ -3,7 +3,7 @@
 # Unit tests for module1/data/anubis_loader.py and module1/data/preprocess.py
 # ─────────────────────────────────────────────────────────────────────────────
 # Tests preprocessing functions (compute_acceleration, random/center_crop,
-# flip_sequence, joint_jitter, speed_perturb) and the ANUBISDataset /
+# flip_sequence, joint_jitter, time_mask, joint_dropout, speed_perturb) and the ANUBISDataset /
 # load_anubis_tensors / build_dataloaders pipeline using in-memory dummy data.
 #
 # Run with: pytest tests/test_anubis_loader.py -v
@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import os
 import tempfile
-from typing import Tuple
+from typing import Iterator, Tuple
 
 import numpy as np
 import pytest
@@ -24,9 +24,11 @@ from module1.data.preprocess import (
     center_crop,
     compute_acceleration,
     flip_sequence,
+    joint_dropout,
     joint_jitter,
     random_crop,
     speed_perturb,
+    time_mask,
 )
 
 
@@ -70,7 +72,7 @@ def tensor_pair() -> Tuple[torch.Tensor, torch.Tensor]:
 
 
 @pytest.fixture
-def tmp_npy_files() -> Tuple[str, str, str]:
+def tmp_npy_files() -> Iterator[Tuple[str, str, str]]:
     """Write dummy .npy files to a temp dir; yield (dir, feat_path, lbl_path)."""
     np.random.seed(1)
     raw = np.random.randn(N, C, T, J).astype(np.float32)
@@ -212,6 +214,32 @@ class TestJointJitter:
         original = sample.clone()
         joint_jitter(sample, std=0.1)
         assert torch.allclose(sample, original)
+
+
+class TestTimeMask:
+    def test_output_shape(self, sample: torch.Tensor) -> None:
+        masked = time_mask(sample, max_mask_frames=6)
+        assert masked.shape == sample.shape
+
+    def test_zero_frames_is_identity(self, sample: torch.Tensor) -> None:
+        masked = time_mask(sample, max_mask_frames=0)
+        assert torch.allclose(masked, sample)
+
+
+class TestJointDropout:
+    def test_output_shape(self, sample: torch.Tensor) -> None:
+        dropped = joint_dropout(sample, drop_prob=0.2)
+        assert dropped.shape == sample.shape
+
+    def test_zero_prob_is_identity(self, sample: torch.Tensor) -> None:
+        dropped = joint_dropout(sample, drop_prob=0.0)
+        assert torch.allclose(dropped, sample)
+
+    def test_some_joint_is_zeroed(self, sample: torch.Tensor) -> None:
+        torch.manual_seed(0)
+        dropped = joint_dropout(sample, drop_prob=0.9)
+        zeroed = (dropped.abs().sum(dim=(0, 2)) == 0).any().item()
+        assert zeroed
 
 
 # ── speed_perturb ─────────────────────────────────────────────────────────────

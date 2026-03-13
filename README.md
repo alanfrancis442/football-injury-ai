@@ -67,23 +67,20 @@ uv pip install torch-scatter torch-sparse -f https://data.pyg.org/whl/torch-2.1.
 ## Common Commands
 
 ```bash
-# Train ANUBIS pretraining
-uv run module1/pretrain/train.py --config configs/pretrain.yaml
+# Train the clean transformer baseline
+uv run module1/pretrain/train.py --config configs/experiments/module1/baseline_transformer.yaml
 
-# Train final pretraining config (official val split)
-uv run module1/pretrain/train.py --config configs/pretrain_final.yaml
-
-# Train Perceiver + RoPE experiment
-uv run module1/pretrain/train.py --config configs/pretrain_perceiver_rope.yaml
+# Train the TCN ablation
+uv run module1/pretrain/train.py --config configs/experiments/module1/tcn_ablation.yaml
 
 # Evaluate
-uv run module1/pretrain/evaluate.py --config configs/pretrain.yaml --ckpt outputs/checkpoints/pretrain/pretrain_best.pt
+uv run module1/pretrain/evaluate.py --config configs/experiments/module1/baseline_transformer.yaml --ckpt outputs/checkpoints/module1/baseline_transformer/pretrain_best.pt
 
 # Live webcam/video action test
-uv run module1/pretrain/live_inference.py --config configs/pretrain_final.yaml --ckpt outputs/checkpoints/pretrain/pretrain_best.pt --source 0
+uv run module1/pretrain/live_inference.py --config configs/experiments/module1/baseline_transformer.yaml --ckpt outputs/checkpoints/module1/baseline_transformer/pretrain_best.pt --source 0
 
 # Run Optuna tuning
-uv run module1/pretrain/tune_optuna.py --config configs/pretrain.yaml --n-trials 30
+uv run module1/pretrain/tune_optuna.py --config configs/experiments/module1/baseline_transformer.yaml --n-trials 30
 
 # Run tests
 uv run pytest tests/
@@ -101,5 +98,5 @@ See [docs/COMMANDS.md](docs/COMMANDS.md) for the full command list.
 
 1. **Experiment** in `notebooks/` — break things freely here
 2. **Port clean code** into the matching `module1/` file once it works
-3. **Adjust hyperparameters** in `configs/pretrain.yaml` — never hardcode them
+3. **Adjust hyperparameters** in `configs/experiments/module1/*.yaml` — never hardcode them
 4. **Verify nothing broke** with `uv run pytest tests/`

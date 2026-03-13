@@ -2,8 +2,8 @@
 #
 # Unit tests for module1/pretrain/live_utils.py and module1/pose/extractor.py
 # -----------------------------------------------------------------------------
-# Covers: source parsing, feature-window construction (pos+vel+acc), label-map
-# loading, EMA smoothing, and MediaPipe33->ANUBIS32 joint conversion.
+# Covers source parsing, feature-window construction, label-map loading,
+# smoothing, motion gating, hysteresis, and MediaPipe33->ANUBIS32 conversion.
 #
 # Run with: pytest tests/test_live_pipeline.py -v
 
@@ -20,13 +20,18 @@ import yaml
 
 from module1.pose.extractor import mediapipe33_to_anubis32
 from module1.pretrain.live_utils import (
+    BACKGROUND_LABEL,
+    PredictionTracker,
     build_feature_window,
     compute_acceleration,
+    compute_motion_energy,
     compute_velocity,
+    decode_prediction,
     load_class_names,
     normalise_pelvis_center,
     parse_video_source,
     smooth_probs,
+    update_prediction_tracker,
 )
 
 
@@ -57,7 +62,6 @@ class TestFeatureConstruction:
         vel = compute_velocity(pos)
         acc = compute_acceleration(vel)
 
-        # Forward differences on x channel
         assert np.allclose(
             vel[:, 0, 0], np.array([1.0, 2.0, 3.0, 3.0], dtype=np.float32)
         )
@@ -66,22 +70,21 @@ class TestFeatureConstruction:
         )
 
     def test_build_feature_window_shape_and_order(self) -> None:
-        T = 5
-        J = 3
-        pos = np.zeros((T, J, 3), dtype=np.float32)
-        # Simple motion for joint 1 on x axis; pelvis is joint 0.
+        pos = np.zeros((5, 3, 3), dtype=np.float32)
         pos[:, 0, :] = np.array([10.0, 0.0, 0.0], dtype=np.float32)
-        pos[:, 1, 0] = np.arange(T, dtype=np.float32)
+        pos[:, 1, 0] = np.arange(5, dtype=np.float32)
 
         feat = build_feature_window(pos, pelvis_idx=0)
-        assert feat.shape == (T, J, 9)
-
-        # Channels 0:3 are centred positions. Pelvis must be zeros.
-        assert torch.allclose(feat[:, 0, 0:3], torch.zeros((T, 3), dtype=torch.float32))
-        # Channels 3:6 are velocity. Joint-1 x velocity is 1 except last duplicated.
+        assert feat.shape == (5, 3, 9)
+        assert torch.allclose(feat[:, 0, 0:3], torch.zeros((5, 3), dtype=torch.float32))
         assert torch.allclose(
             feat[:, 1, 3], torch.tensor([1, 1, 1, 1, 1], dtype=torch.float32)
         )
+
+    def test_motion_energy_positive_for_motion(self) -> None:
+        pos = np.zeros((5, 2, 3), dtype=np.float32)
+        pos[:, 1, 0] = np.arange(5, dtype=np.float32)
+        assert compute_motion_energy(pos) > 0.0
 
 
 class TestClassNames:
@@ -124,6 +127,63 @@ class TestSmoothProbs:
         assert torch.allclose(out, torch.tensor([0.3, 0.7]))
 
 
+class TestLivePredictionFiltering:
+    def test_low_motion_decodes_to_background(self) -> None:
+        decoded = decode_prediction(
+            probs=torch.tensor([0.8, 0.2]),
+            class_names=["walk", "run"],
+            motion_energy=0.0,
+            min_confidence=0.5,
+            min_margin=0.1,
+            min_motion_energy=0.01,
+        )
+        assert decoded.is_background
+        assert decoded.label == BACKGROUND_LABEL
+        assert decoded.reason == "low_motion"
+
+    def test_low_margin_decodes_to_background(self) -> None:
+        decoded = decode_prediction(
+            probs=torch.tensor([0.52, 0.48]),
+            class_names=["walk", "run"],
+            motion_energy=0.5,
+            min_confidence=0.5,
+            min_margin=0.1,
+            min_motion_energy=0.01,
+        )
+        assert decoded.is_background
+        assert decoded.reason == "low_margin"
+
+    def test_hysteresis_requires_repeated_candidate(self) -> None:
+        tracker = PredictionTracker()
+        decoded = decode_prediction(
+            probs=torch.tensor([0.9, 0.1]),
+            class_names=["walk", "run"],
+            motion_energy=0.5,
+            min_confidence=0.5,
+            min_margin=0.1,
+            min_motion_energy=0.01,
+        )
+        tracker = update_prediction_tracker(tracker, decoded, hysteresis_frames=2)
+        assert tracker.displayed_label == BACKGROUND_LABEL
+        tracker = update_prediction_tracker(tracker, decoded, hysteresis_frames=2)
+        assert tracker.displayed_label == "walk"
+
+    def test_background_resets_display_immediately(self) -> None:
+        tracker = PredictionTracker(
+            displayed_label="walk", displayed_index=0, displayed_score=0.9
+        )
+        decoded = decode_prediction(
+            probs=torch.tensor([0.6, 0.4]),
+            class_names=["walk", "run"],
+            motion_energy=0.0,
+            min_confidence=0.5,
+            min_margin=0.1,
+            min_motion_energy=0.01,
+        )
+        tracker = update_prediction_tracker(tracker, decoded, hysteresis_frames=2)
+        assert tracker.displayed_label == BACKGROUND_LABEL
+
+
 class TestMediapipeConversion:
     def test_output_shape(self) -> None:
         mp = np.zeros((33, 4), dtype=np.float32)
@@ -132,17 +192,17 @@ class TestMediapipeConversion:
 
     def test_pelvis_is_midpoint_of_hips(self) -> None:
         mp = np.zeros((33, 4), dtype=np.float32)
-        mp[23, :3] = np.array([2.0, 0.0, 0.0], dtype=np.float32)  # left hip
-        mp[24, :3] = np.array([4.0, 2.0, 0.0], dtype=np.float32)  # right hip
+        mp[23, :3] = np.array([2.0, 0.0, 0.0], dtype=np.float32)
+        mp[24, :3] = np.array([4.0, 2.0, 0.0], dtype=np.float32)
         out = mediapipe33_to_anubis32(mp)
         assert np.allclose(out[0], np.array([3.0, 1.0, 0.0], dtype=np.float32))
 
     def test_direct_joint_mappings(self) -> None:
         mp = np.zeros((33, 4), dtype=np.float32)
-        mp[23, :3] = np.array([1, 2, 3], dtype=np.float32)  # L_Hip
-        mp[24, :3] = np.array([4, 5, 6], dtype=np.float32)  # R_Hip
-        mp[25, :3] = np.array([7, 8, 9], dtype=np.float32)  # L_Knee
-        mp[26, :3] = np.array([10, 11, 12], dtype=np.float32)  # R_Knee
+        mp[23, :3] = np.array([1, 2, 3], dtype=np.float32)
+        mp[24, :3] = np.array([4, 5, 6], dtype=np.float32)
+        mp[25, :3] = np.array([7, 8, 9], dtype=np.float32)
+        mp[26, :3] = np.array([10, 11, 12], dtype=np.float32)
         out = mediapipe33_to_anubis32(mp)
         assert np.allclose(out[6], mp[23, :3])
         assert np.allclose(out[11], mp[24, :3])

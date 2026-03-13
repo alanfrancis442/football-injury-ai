@@ -154,6 +154,60 @@ def joint_jitter(x: torch.Tensor, std: float) -> torch.Tensor:
     return x + torch.randn_like(x) * std
 
 
+def time_mask(x: torch.Tensor, max_mask_frames: int) -> torch.Tensor:
+    """
+    Replace a short contiguous time span with a nearby frame.
+
+    Parameters
+    ----------
+    x : torch.Tensor  shape (T, J, F)
+    max_mask_frames : int
+        Maximum number of consecutive frames to mask.
+
+    Returns
+    -------
+    masked : torch.Tensor  shape (T, J, F)
+    """
+    if max_mask_frames <= 0 or x.shape[0] < 2:
+        return x
+
+    T = x.shape[0]
+    span = int(torch.randint(1, min(max_mask_frames, T - 1) + 1, (1,)).item())
+    start = int(torch.randint(0, T - span + 1, (1,)).item())
+
+    masked = x.clone()
+    source_idx = start - 1 if start > 0 else min(T - 1, start + span)
+    masked[start : start + span] = masked[source_idx].unsqueeze(0).expand(span, -1, -1)
+    return masked
+
+
+def joint_dropout(x: torch.Tensor, drop_prob: float) -> torch.Tensor:
+    """
+    Randomly zero out whole joints across the full temporal window.
+
+    Parameters
+    ----------
+    x : torch.Tensor  shape (T, J, F)
+    drop_prob : float
+        Probability of dropping each joint.
+
+    Returns
+    -------
+    dropped : torch.Tensor  shape (T, J, F)
+    """
+    clipped_prob = float(min(max(drop_prob, 0.0), 1.0))
+    if clipped_prob <= 0.0:
+        return x
+
+    keep_mask = torch.rand(x.shape[1], device=x.device) >= clipped_prob
+    if not torch.any(keep_mask):
+        keep_mask[torch.randint(0, x.shape[1], (1,), device=x.device)] = True
+
+    dropped = x.clone()
+    dropped[:, ~keep_mask, :] = 0.0
+    return dropped
+
+
 def speed_perturb(
     x: torch.Tensor,  # (T, J, F)
     factor_range: Tuple[float, float],
@@ -232,6 +286,14 @@ if __name__ == "__main__":
     # Jitter
     jittered = joint_jitter(sample, std=0.01)
     assert jittered.shape == sample.shape
+
+    # Time mask
+    masked = time_mask(sample, max_mask_frames=6)
+    assert masked.shape == sample.shape
+
+    # Joint dropout
+    dropped = joint_dropout(sample, drop_prob=0.2)
+    assert dropped.shape == sample.shape
 
     # Speed perturb
     perturbed = speed_perturb(sample, factor_range=(0.8, 1.2), target_len=60)

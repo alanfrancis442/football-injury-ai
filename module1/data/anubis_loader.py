@@ -5,7 +5,7 @@
 # Loads preprocessed ANUBIS skeleton data from .npy files and exposes it as a
 # PyTorch Dataset / DataLoader pair ready for model training.
 #
-# Expected files on disk (configured in configs/pretrain.yaml):
+# Expected files on disk (configured in the Stage 1 experiment YAML):
 #   trn_features_cleaned.npy  —  shape (N, 6, 60, 32)
 #                                  OR (N, 6, 60, 32, M)
 #                                  axes: (samples, channels, frames, joints[, persons])
@@ -34,9 +34,11 @@ from module1.data.preprocess import (
     center_crop,
     compute_acceleration,
     flip_sequence,
+    joint_dropout,
     joint_jitter,
     random_crop,
     speed_perturb,
+    time_mask,
 )
 from utils.logger import get_logger
 
@@ -69,8 +71,10 @@ class ANUBISDataset(Dataset):
         Augmentation hyper-parameters.  Keys:
           flip_prob        (float, default 0.5)
           joint_jitter_std (float, default 0.01)
-          speed_perturb    (bool,  default True)
-          speed_range      (list,  default [0.8, 1.2])
+          speed_perturb      (bool,  default True)
+          speed_range        (list,  default [0.8, 1.2])
+          time_mask_frames   (int,   default 0)
+          joint_drop_prob    (float, default 0.0)
     """
 
     def __init__(
@@ -120,6 +124,18 @@ class ANUBISDataset(Dataset):
             if std > 0:
                 x = joint_jitter(x, std)
 
+        # ── Time masking ───────────────────────────────────────────────────────
+        if self.augment:
+            max_mask_frames = int(self.aug_cfg.get("time_mask_frames", 0))
+            if max_mask_frames > 0:
+                x = time_mask(x, max_mask_frames=max_mask_frames)
+
+        # ── Joint dropout ──────────────────────────────────────────────────────
+        if self.augment:
+            drop_prob = float(self.aug_cfg.get("joint_drop_prob", 0.0))
+            if drop_prob > 0.0:
+                x = joint_dropout(x, drop_prob=drop_prob)
+
         return x, y
 
 
@@ -132,7 +148,7 @@ def _load_npy(path: str, desc: str) -> np.ndarray:
         raise FileNotFoundError(
             f"{desc} not found: {path}\n"
             "Copy your preprocessed ANUBIS files to the anubis_dir specified in "
-            "configs/pretrain.yaml, then run again."
+            "the experiment config, then run again."
         )
     arr = np.load(path)
     log.info("Loaded %s  shape=%s  dtype=%s", desc, arr.shape, arr.dtype)
@@ -204,7 +220,7 @@ def build_dataloaders(
     Parameters
     ----------
     cfg : dict
-        Full config dict loaded from configs/pretrain.yaml.
+        Full config dict loaded from the Stage 1 experiment YAML.
     num_workers : int
         DataLoader worker processes.
     pin_memory : bool

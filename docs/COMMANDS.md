@@ -53,41 +53,33 @@ uv run scripts/anubis_feature_stats.py
 
 ## Training (Stage 1: ANUBIS Pretraining)
 
-### Standard Training
+### Transformer Baseline
 
 ```bash
-uv run module1/pretrain/train.py --config configs/pretrain.yaml
+uv run module1/pretrain/train.py --config configs/experiments/module1/baseline_transformer.yaml
 ```
 
-### With Custom Checkpoint Path
+### TCN Ablation
 
 ```bash
-uv run module1/pretrain/train.py --config configs/pretrain.yaml --checkpoint outputs/checkpoints/pretrain/my_run.pt
+uv run module1/pretrain/train.py --config configs/experiments/module1/tcn_ablation.yaml
 ```
 
 ### Hyperparameter Tuning (Optuna)
 
 ```bash
 # Run 30 trials
-uv run module1/pretrain/tune_optuna.py --config configs/pretrain.yaml --n-trials 30
+uv run module1/pretrain/tune_optuna.py --config configs/experiments/module1/baseline_transformer.yaml --n-trials 30
 
 # Run with custom timeout (e.g., 2 hours)
-uv run module1/pretrain/tune_optuna.py --config configs/pretrain.yaml --timeout-sec 7200
+uv run module1/pretrain/tune_optuna.py --config configs/experiments/module1/baseline_transformer.yaml --timeout-sec 7200
 ```
 
 ### Train with Best Tuned Parameters
 
 ```bash
-uv run module1/pretrain/train.py --config outputs/logs/pretrain_optuna_best.yaml
+uv run module1/pretrain/train.py --config outputs/logs/module1/baseline_transformer/pretrain_optuna_best.yaml
 ```
-
-### Train Perceiver + RoPE Experiment
-
-```bash
-uv run module1/pretrain/train.py --config configs/pretrain_perceiver_rope.yaml
-```
-
-Note: checkpoints from Transformer and Perceiver variants are not interchangeable.
 
 ---
 
@@ -97,28 +89,25 @@ Note: checkpoints from Transformer and Perceiver variants are not interchangeabl
 
 ```bash
 # Basic evaluation
-uv run module1/pretrain/evaluate.py --config configs/pretrain.yaml --ckpt outputs/checkpoints/pretrain/pretrain_best.pt
+uv run module1/pretrain/evaluate.py --config configs/experiments/module1/baseline_transformer.yaml --ckpt outputs/checkpoints/module1/baseline_transformer/pretrain_best.pt
 
 # With t-SNE visualization
-uv run module1/pretrain/evaluate.py --config configs/pretrain.yaml --ckpt outputs/checkpoints/pretrain/pretrain_best.pt --tsne
+uv run module1/pretrain/evaluate.py --config configs/experiments/module1/baseline_transformer.yaml --ckpt outputs/checkpoints/module1/baseline_transformer/pretrain_best.pt --tsne
 
-# Perceiver + RoPE checkpoint evaluation
-uv run module1/pretrain/evaluate.py --config configs/pretrain_perceiver_rope.yaml --ckpt outputs/checkpoints/pretrain/pretrain_best.pt --split val --tsne
-```
-
-### Evaluate with Final Pretraining Config
-
-```bash
-uv run module1/pretrain/evaluate.py --config configs/pretrain_final.yaml --ckpt outputs/checkpoints/pretrain/pretrain_best.pt --split val --tsne
+# TCN ablation evaluation
+uv run module1/pretrain/evaluate.py --config configs/experiments/module1/tcn_ablation.yaml --ckpt outputs/checkpoints/module1/tcn_ablation/pretrain_best.pt --split val --tsne
 ```
 
 ### Checkpoint Locations
 
 | Checkpoint | Path |
 |------------|------|
-| Best (by val loss) | `outputs/checkpoints/pretrain/pretrain_best.pt` |
-| Periodic (every 10 epochs) | `outputs/checkpoints/pretrain/pretrain_ep{N:04d}.pt` |
-| Optuna best | `outputs/logs/pretrain_optuna_best.yaml` |
+| Baseline best (by val top-1) | `outputs/checkpoints/module1/baseline_transformer/pretrain_best.pt` |
+| Baseline best macro F1 | `outputs/checkpoints/module1/baseline_transformer/pretrain_best_macro_f1.pt` |
+| Baseline best loss | `outputs/checkpoints/module1/baseline_transformer/pretrain_best_loss.pt` |
+| Baseline periodic | `outputs/checkpoints/module1/baseline_transformer/pretrain_ep{N:04d}.pt` |
+| TCN best (by val top-1) | `outputs/checkpoints/module1/tcn_ablation/pretrain_best.pt` |
+| Optuna best config | `outputs/logs/module1/baseline_transformer/pretrain_optuna_best.yaml` |
 
 ---
 
@@ -128,15 +117,22 @@ uv run module1/pretrain/evaluate.py --config configs/pretrain_final.yaml --ckpt 
 
 This tests the pretrained ANUBIS action model on live footage.
 
+Important: config and checkpoint architecture must match.
+- Transformer checkpoint -> `configs/experiments/module1/baseline_transformer.yaml`
+- TCN checkpoint -> `configs/experiments/module1/tcn_ablation.yaml`
+
 ```bash
 # Webcam (index 0)
-uv run module1/pretrain/live_inference.py --config configs/pretrain_final.yaml --ckpt outputs/checkpoints/pretrain/pretrain_best.pt --source 0
+uv run module1/pretrain/live_inference.py --config configs/experiments/module1/baseline_transformer.yaml --ckpt outputs/checkpoints/module1/baseline_transformer/pretrain_best.pt --source 0
+
+# Webcam (TCN checkpoint)
+uv run module1/pretrain/live_inference.py --config configs/experiments/module1/tcn_ablation.yaml --ckpt outputs/checkpoints/module1/tcn_ablation/pretrain_best.pt --source 0
 
 # Video file
-uv run module1/pretrain/live_inference.py --config configs/pretrain_final.yaml --ckpt outputs/checkpoints/pretrain/pretrain_best.pt --source data/samples/clip.mp4
+uv run module1/pretrain/live_inference.py --config configs/experiments/module1/baseline_transformer.yaml --ckpt outputs/checkpoints/module1/baseline_transformer/pretrain_best.pt --source data/samples/clip.mp4
 
 # RTSP stream
-uv run module1/pretrain/live_inference.py --config configs/pretrain_final.yaml --ckpt outputs/checkpoints/pretrain/pretrain_best.pt --source "rtsp://<user>:<pass>@<ip>:554/stream"
+uv run module1/pretrain/live_inference.py --config configs/experiments/module1/baseline_transformer.yaml --ckpt outputs/checkpoints/module1/baseline_transformer/pretrain_best.pt --source "rtsp://<user>:<pass>@<ip>:554/stream"
 ```
 
 Optional flags:
@@ -155,6 +151,14 @@ uv run module1/pretrain/live_inference.py --source 0 --label-map outputs/logs/an
 uv run module1/pretrain/live_inference.py --source data/samples/clip.mp4 --no-show
 ```
 
+Live window now shows:
+- stable displayed label with pause/background rejection
+- top-k ranked action predictions
+- skeleton pose overlay drawn from detected joints
+
+By default, for 102-class ANUBIS models, live inference auto-loads
+`module1/data/anubis_class_names.yaml` so action names are shown directly.
+
 Exit live mode with `q` or `Esc`.
 
 ### Run All Tests
@@ -170,6 +174,7 @@ uv run pytest tests/test_model.py -v
 uv run pytest tests/test_anubis_loader.py -v
 uv run pytest tests/test_joint_config.py -v
 uv run pytest tests/test_live_pipeline.py -v
+uv run pytest tests/test_live_label_map.py -v
 ```
 
 ### Run Single Test
@@ -203,7 +208,8 @@ football-injury-ai/
 │   │   └── live_utils.py
 │   └── ...
 ├── configs/
-│   ├── pretrain.yaml      # ANUBIS pretraining config
+│   ├── experiments/module1/baseline_transformer.yaml
+│   ├── experiments/module1/tcn_ablation.yaml
 │   └── module1.yaml       # Fine-tuning config
 ├── scripts/               # Utility scripts
 │   ├── anubis_label_stats.py
@@ -230,13 +236,13 @@ python -c "import torch; print('CUDA:', torch.cuda.is_available())"
 ### View Training Logs
 
 ```bash
-cat outputs/logs/run.log
+cat outputs/logs/module1/baseline_transformer/training_history.json
 ```
 
 ### Delete Old Checkpoints
 
 ```bash
-rm outputs/checkpoints/pretrain/pretrain_ep*.pt
+rm outputs/checkpoints/module1/baseline_transformer/pretrain_ep*.pt
 ```
 
 ---
@@ -268,7 +274,7 @@ training:
 Make sure you're running from the project root directory:
 ```bash
 cd football-injury-ai
-uv run module1/pretrain/train.py --config configs/pretrain.yaml
+uv run module1/pretrain/train.py --config configs/experiments/module1/baseline_transformer.yaml
 ```
 
 ---
