@@ -19,6 +19,8 @@ data/raw/
 data/processed/
 data/samples/
 data/anubis/
+data/football/
+anubis_dataset/
 
 # Model outputs
 outputs/checkpoints/

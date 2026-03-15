@@ -1,64 +1,82 @@
-# configs/module1.yaml
-#
-# Module 1 — Biomechanical Risk Monitor  (fine-tuning / inference config)
-# ────────────────────────────────────────────────────────────────────────
-# Hyperparameters for fine-tuning the pretrained SpatioTemporalEncoder on
-# labelled football clips and for real-time inference.
-#
-# Pretraining hyperparameters are in configs/pretrain.yaml.
-# Never hardcode any of these values inside Python files.
+# Module 1 Configuration
 
-# ── File paths ────────────────────────────────────────────────────────────────
-paths:
-  raw_dir:           data/raw/
-  processed_dir:     data/processed/
-  samples_dir:       data/samples/
-  checkpoint_dir:    outputs/checkpoints/
-  log_dir:           outputs/logs/
-  pretrained_encoder: outputs/checkpoints/pretrain/pretrain_best.pt
-
-# ── Skeleton / data format ────────────────────────────────────────────────────
+# Data paths
 data:
-  num_joints:   32       # ANUBIS 32-joint pelvis-rooted skeleton
-  in_features:   9       # per-joint features: [x,y,z, vx,vy,vz, ax,ay,az]
-  seq_len:      60       # frames per sliding window fed to the model
-  num_classes:   2       # binary: healthy (0) / at-risk (1)
+  football_root: data/football
+  raw_videos: data/football/raw
+  clips: data/football/clips
+  annotations: data/football/annotations/annotations.csv
+  poses: data/football/poses
+  features: data/football/features
 
-# ── Model (must match pretrained encoder dims) ────────────────────────────────
+# Pose estimation
+pose:
+  backend: mediapipe  # mediapipe | vitpose
+  model: lite        # lite | full
+  num_keypoints: 33
+  min_detection_confidence: 0.5
+  min_tracking_confidence: 0.5
+
+# Model configuration
 model:
-  gat_hidden_dim:          64
-  gat_heads:                4
-  gat_dropout:            0.1
-  d_model:                128
-  nhead:                    4
-  num_transformer_layers:   2
-  dim_feedforward:        256
-  transformer_dropout:    0.1
+  # Approach A: GNN + TCN
+  gnn:
+    hidden_dim: 128
+    num_layers: 4
+    num_heads: 4
+    dropout: 0.1
+    edge_type: spatial  # spatial | kinematic
+  
+  temporal:
+    type: tcn  # tcn | transformer
+    hidden_dim: 128
+    num_layers: 3
+    kernel_size: 3
+    dropout: 0.1
 
-# ── Fine-tuning ───────────────────────────────────────────────────────────────
+  # Approach B: GNN + Transformer (alternative)
+  transformer:
+    hidden_dim: 128
+    num_layers: 3
+    num_heads: 4
+    dropout: 0.1
+    use_rope: false
+
+# Training
 training:
-  epochs:            30
-  batch_size:        32
-  learning_rate:  0.0001   # lower LR for fine-tuning
-  weight_decay:  0.0001
-  warmup_epochs:      2
-  grad_clip_norm:   1.0
-  label_smoothing:  0.05
+  batch_size: 32
+  num_epochs: 100
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  scheduler: cosine
+  early_stopping_patience: 15
 
-  # Class imbalance — at-risk samples are rare; increase if model misses them
-  class_weight_healthy: 1.0
-  class_weight_at_risk: 4.0
+# Data splits
+splits:
+  train: 0.7
+  val: 0.15
+  test: 0.15
+  split_by: source_video  # source_video | player | match
 
-# ── Body-region localisation head ────────────────────────────────────────────
-region_head:
-  num_regions:         11   # matches NUM_REGIONS in joint_config.py
-  region_loss_weight: 0.3   # weight of region-classification loss
+# Labels
+labels:
+  num_actions: 11
+  num_risk_patterns: 10
+  num_body_regions: 11
 
-# ── Inference / risk thresholds ───────────────────────────────────────────────
-inference:
-  risk_tier_thresholds:
-    green:  0.30
-    amber:  0.55
-    orange: 0.75
-    # above 0.75 → RED
-  sustained_window: 3    # consecutive windows before escalating alert tier
+# Evaluation
+evaluation:
+  metrics:
+    - false_positives_per_minute
+    - precision_at_recall
+    - action_f1
+    - risk_pattern_f1
+    - body_region_f1
+  
+  confidence_threshold: 0.7
+
+# Hardware
+hardware:
+  device: cuda
+  num_workers: 4
+  pin_memory: true
